@@ -1,0 +1,11 @@
+{
+  "name": "oc-cf-aig-subscription",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Host-only OpenCode v2 adapter: native ChatGPT SIWC to Cloudflare AI Gateway without BYOK fallback",
+  "exports": { ".": "./src/index.js" },
+  "scripts": { "test": "node --test", "check": "node --check src/index.js && node --check src/gateway.mjs" },
+  "dependencies": { "@opencode/plugin": "2.2.5" },
+  "engines": { "node": ">=22" }
+}
