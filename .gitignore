@@ -1,0 +1,12 @@
+# Secrets must never enter this public repository
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+profile.json
+auth.json
+host-id.json
+node_modules/
+coverage/
+.DS_Store
