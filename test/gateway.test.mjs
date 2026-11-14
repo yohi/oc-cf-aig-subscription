@@ -100,3 +100,22 @@ test("direct, non-responses and wrong-policy requests are refused", () => {
   assert.throws(() => assertGatewayRequest(req(`${endpoint}/responses`, { ...headers, "x-api-key": "test" }), endpoint), /API-key/)
   assert.throws(() => assertGatewayRequest(req(`${endpoint}/responses`, { ...headers, "cf-aig-no-wholesale": "false" }), endpoint), /policy/)
 })
+
+test("invalid Gateway configuration completes setup with scoped deny hooks", async () => {
+  for (const invalid of [
+    { CF_AIG_BASE: "https://invalid.example/v1/not-a-gateway" },
+    { CF_AIG_TOKEN: "" },
+    { CF_AIG_TOKEN: "bad\nheader" },
+  ]) {
+    const f = fakeCtx()
+    await assert.doesNotReject(registerGateway(f.ctx, { ...env, ...invalid }))
+    assert.deepEqual(Object.keys(f.hooks).sort(), ["http.request", "model.request"])
+    assert.equal(f.provider.settings.transport, "websocket", "Provider transform must not occur with invalid settings")
+    for (const name of ["model.request", "http.request"]) {
+      assert.deepEqual(f.hooks[name].scope, { providerID: "openai" })
+      assert.throws(() => f.hooks[name].callback({}), /configuration invalid; OpenAI requests blocked/)
+      // The same callback must still reject after setup has returned.
+      assert.throws(() => f.hooks[name].callback({}), /configuration invalid; OpenAI requests blocked/)
+    }
+  }
+})
