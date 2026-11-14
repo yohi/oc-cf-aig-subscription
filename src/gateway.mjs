@@ -61,7 +61,20 @@ export async function registerGateway(ctx, env = process.env) {
   if (env.OC_CF_AIG_HOST_ONLY !== "1") {
     throw new Error("Host-only mode is not enabled; sandbox isolation is not implemented")
   }
-  const { endpoint, token } = settingsFromEnv(env)
+  let settings
+  try {
+    settings = settingsFromEnv(env)
+  } catch {
+    // Plugin setup must complete so that the scoped rejection hooks remain active.
+    // Rethrowing after registration would close the activation scope and remove them.
+    const refuse = () => {
+      throw new Error("Cloudflare AI Gateway configuration invalid; OpenAI requests blocked")
+    }
+    await ctx.session.hook("model.request", refuse, { providerID: "openai" })
+    await ctx.session.hook("http.request", refuse, { providerID: "openai" })
+    return
+  }
+  const { endpoint, token } = settings
 
   await ctx.provider.transform((editor) => {
     if (!editor.get("openai")) throw new Error("OpenAI native provider is unavailable")
