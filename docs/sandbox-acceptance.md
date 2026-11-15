@@ -12,7 +12,22 @@ Pinned targets: Docker Sandboxes CLI `v0.51.0`, OpenCode `v2.2.5`, Node.js `>=22
 | 7 Independent egress denial matrix | NOT_RUN | Depends on step 6. |
 
 Gate status: Task 1 STOP gate is **not yet satisfied**. Host-to-Guest reachability and network
-denial are unverified; do not advance Tasks 2-5 until Steps 5-7 are run and recorded.
+denial are unverified. Tasks 2-4 were implemented offline under the Owner-delegated scope; no
+Sandbox, policy or live step may proceed until Steps 5-7 are run and recorded.
+
+## Task 3: Host-only SIWC (offline, mocked endpoints)
+
+All OAuth/JWKS/token endpoints are mocked; no real credential or network was used.
+
+| Item | Status |
+| --- | --- |
+| SIWC lifecycle, credential store, refresh, lock (mocked) | PASS (offline) |
+| Live Host-only SIWC smoke (one Responses request) | NOT_RUN (no Owner gate) |
+| JWKS URL (`https://auth.openai.com/.well-known/jwks.json`) in `src/broker/siwc.mjs` | NOT_VERIFIED (assumed) |
+| Callback query parameter name `client_id` for the issued client ID | NOT_VERIFIED (assumed; wrong value fails closed at login) |
+| `earliest_refresh_at` unit (treated as epoch seconds) | NOT_VERIFIED (a wrong unit could block refresh until re-login) |
+| Reauth `--id-token-hint` URL printed to a TTY on stderr (explicit opt-in) | Residual exposure, accepted only by Owner decision |
+| Upstream billing attribution ($0) | NOT_VERIFIED |
 
 ## Task 4: Guest OpenCode provider and guest-only tool execution
 
