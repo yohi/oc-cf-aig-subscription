@@ -249,3 +249,57 @@ test("withLock refuses a symlinked lock file", async () => {
   );
   assert.equal(fs.readFileSync(target, "utf8"), "keep");
 });
+
+test("withLock treats a fresh empty/unparseable lockfile (holder mid-write) as live and does not steal it", async () => {
+  const { file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  fs.writeFileSync(`${file}.lock`, "", { mode: 0o600 });
+  await assert.rejects(
+    createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 80, lockStaleMs: 60_000 }).withLock(async () => assert.fail("stole lock")),
+    (e) => e instanceof CredentialStoreError && e.code === "lock_timeout",
+  );
+  assert.ok(fs.existsSync(`${file}.lock`), "live lock not removed");
+  fs.writeFileSync(`${file}.lock`, "{not json", { mode: 0o600 });
+  await assert.rejects(
+    createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 80, lockStaleMs: 60_000 }).withLock(async () => assert.fail("stole lock")),
+    (e) => e.code === "lock_timeout",
+  );
+});
+
+test("withLock recovers an empty lockfile only after it is older than lockStaleMs", async () => {
+  const { file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  fs.writeFileSync(`${file}.lock`, "", { mode: 0o600 });
+  const old = new Date(Date.now() - 120_000);
+  fs.utimesSync(`${file}.lock`, old, old);
+  let ran = false;
+  await createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 2000, lockStaleMs: 60_000 }).withLock(async () => {
+    ran = true;
+  });
+  assert.ok(ran);
+});
+
+test("lockfile is never observable without its owner record (atomic publish) and leaves no temp files", async () => {
+  const { dir, file } = freshPath();
+  const store = createCredentialStore({ path: file, lockPollMs: 5 });
+  store.ensureHostId();
+  await store.withLock(async () => {
+    const info = JSON.parse(fs.readFileSync(`${file}.lock`, "utf8"));
+    assert.equal(info.pid, process.pid);
+    assert.equal(typeof info.token, "string");
+    assert.equal(fs.lstatSync(`${file}.lock`).mode & 0o777, 0o600);
+  });
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n !== "siwc.json"), []);
+});
+
+test("release does not unlink a lock that was replaced by another holder", async () => {
+  const { file } = freshPath();
+  const store = createCredentialStore({ path: file, lockPollMs: 5 });
+  store.ensureHostId();
+  const foreign = JSON.stringify({ pid: process.pid, created: Date.now(), token: "someone-else" });
+  await store.withLock(async () => {
+    fs.unlinkSync(`${file}.lock`);
+    fs.writeFileSync(`${file}.lock`, foreign, { mode: 0o600 });
+  });
+  assert.equal(fs.readFileSync(`${file}.lock`, "utf8"), foreign);
+});

@@ -404,7 +404,15 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
       if (!active) fail("not_logged_in", "no SIWC account; run login");
       cached = active;
     }
-    if (usable(cached, clock())) return cached.access_token;
+    let fresh = false;
+    try {
+      fresh = usable(cached, clock());
+    } catch (e) {
+      // In-memory state may be stale (another process may have renewed);
+      // refresh() re-reads the store under the lock and decides from there.
+      if (!(e instanceof SIWCError && e.code === "token_expired")) throw e;
+    }
+    if (fresh) return cached.access_token;
     if (!inflight) {
       const key = cached.key;
       inflight = refresh(key).finally(() => {

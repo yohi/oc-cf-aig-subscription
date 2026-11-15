@@ -461,3 +461,19 @@ test("createSIWCSource refuses non-official authBase and missing fetch", () => {
   assert.throws(() => createSIWCSource({ credentialPath: tmpCred(), authBase: "http://auth.openai.com", client: { fetch: async () => {} } }), SIWCError);
   assert.throws(() => createSIWCSource({ credentialPath: tmpCred(), client: { fetch: "nope" } }), SIWCError);
 });
+
+test("stale in-memory state is re-read under lock before failing token_expired", async () => {
+  const cred = await loggedIn();
+  const store = createCredentialStore({ path: cred });
+  const acct = store.getActive();
+  store.putAccount({ ...acct, earliest_refresh_at: T0 + 7200_000 });
+  const auth = mockAuth();
+  const src = source(cred, auth);
+  nowMs = T0;
+  assert.equal(await src.getAccessToken(), "access-1");
+  // Another process renews the token set.
+  store.putAccount({ ...acct, access_token: "access-other-proc", refresh_token: "refresh-other-proc", expires_at: T0 + 36_000_000, earliest_refresh_at: T0 + 30_000_000 });
+  nowMs = T0 + 3600_000 + 1;
+  assert.equal(await src.getAccessToken(), "access-other-proc");
+  assert.equal(auth.calls.refresh.length, 0);
+});

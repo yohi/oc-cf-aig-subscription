@@ -290,21 +290,47 @@ export function createCredentialStore({
     const token = Buffer.from(randomBytes(16)).toString("hex");
     const deadline = now() + lockTimeoutMs;
     for (;;) {
+      // Publish atomically: write the full owner record to a private temp
+      // file, then hard-link it into place (link fails with EEXIST if held).
+      // Waiters therefore never observe a lock without its owner record.
+      const tmp = path.join(dir, `.${base}.lock.${token}.tmp`);
+      let ino;
       try {
-        const fd = fs.openSync(lockPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+        const fd = fs.openSync(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
         try {
           fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, created: Date.now(), token }));
+          fs.fsyncSync(fd);
+          ino = fs.fstatSync(fd).ino;
         } finally {
           fs.closeSync(fd);
         }
-        return token;
-      } catch (e) {
-        if (e.code !== "EEXIST") fail("lock_failed", "credential lock cannot be created");
+      } catch {
+        try {
+          fs.unlinkSync(tmp);
+        } catch {
+          /* not created */
+        }
+        fail("lock_failed", "credential lock cannot be created");
       }
+      let linked = false;
+      try {
+        fs.linkSync(tmp, lockPath);
+        linked = true;
+      } catch (e) {
+        if (e.code !== "EEXIST") {
+          fs.unlinkSync(tmp);
+          fail("lock_failed", "credential lock cannot be created");
+        }
+      }
+      fs.unlinkSync(tmp);
+      if (linked) return { token, ino };
       const info = readLockInfo();
       if (info) {
         const age = Date.now() - info.mtimeMs;
-        const stale = (info.pid !== process.pid && !pidAlive(info.pid)) || age > lockStaleMs;
+        // An owner record without a valid PID (legacy/foreign writer, torn
+        // write) is treated as live until it ages past lockStaleMs.
+        const deadOwner = Number.isInteger(info.pid) && info.pid !== process.pid && !pidAlive(info.pid);
+        const stale = deadOwner || age > lockStaleMs;
         if (stale) {
           // Re-check right before removal to avoid deleting a fresh lock.
           const again = readLockInfo();
@@ -323,29 +349,30 @@ export function createCredentialStore({
     }
   }
 
-  function release(token) {
+  function release({ token, ino }) {
     try {
       const fd = fs.openSync(lockPath, O_RDONLY | O_NOFOLLOW);
       let mine = false;
       try {
-        mine = JSON.parse(fs.readFileSync(fd, "utf8")).token === token;
+        // Ownership = same inode we linked AND our random token.
+        mine = fs.fstatSync(fd).ino === ino && JSON.parse(fs.readFileSync(fd, "utf8")).token === token;
       } catch {
         mine = false;
       } finally {
         fs.closeSync(fd);
       }
-      if (mine) fs.unlinkSync(lockPath);
+      if (mine && fs.lstatSync(lockPath).ino === ino) fs.unlinkSync(lockPath);
     } catch {
       /* lock already gone */
     }
   }
 
   async function withLock(fn) {
-    const token = await acquire();
+    const held = await acquire();
     try {
       return await fn();
     } finally {
-      release(token);
+      release(held);
     }
   }
 
