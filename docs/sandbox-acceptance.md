@@ -50,3 +50,21 @@ Interface change: `registerGuestProvider(ctx, {brokerURL, capability})` was exte
 `registerGuestProvider(ctx, {brokerURL, capability, mode, fixtureRoot})`. `mode` (`m1`/`m2`) is
 required; `fixtureRoot` is used only in `m2`. `setupGuest(ctx, env)` reads them from
 `OC_CF_AIG_ACCEPTANCE_MODE` and `OC_CF_AIG_GUEST_FIXTURE_ROOT`.
+
+## Task 5: Bounded live acceptance (offline scope only)
+
+| Step | Claim | Result |
+| --- | --- | --- |
+| 1 | `npm test && npm run check` on the implementation branch | PASS (offline, 269 tests) |
+| 1 | Branch diff contains no credential files, tokens or host-specific paths | PASS (grep check) |
+| 2 | Disposable Sandbox effective egress policy readback | NOT_RUN (needs Owner approval for Sandbox + sandbox-scoped policy; Task 1 Steps 5-7) |
+| 3 | Foreground Host Broker with issued capability and Guest handoff in a Sandbox | NOT_RUN |
+| 4 | M1 live: one Guest text inference (`gateway-ok`) | NOT_RUN (no per-gate Owner approval) |
+| 5 | Negative contract tests (revoked/expired/quota/abort/SSE failure/header injection) | PASS against synthetic fixtures (Task 2 tests); Guest-side egress-bypass denial NOT_RUN |
+| 6 | M2 live: Guest function-tool scenario | NOT_RUN (no per-gate Owner approval; separate-process launcher handoff on sbx v0.51.0 not verified) |
+| 7 | Cleanup of Sandbox/rules | NOT_RUN (nothing created) |
+| - | Task 3 Host-only SIWC live smoke | NOT_RUN |
+| - | Upstream billing attribution ($0) | NOT_VERIFIED |
+| - | M1 live PASS / M2 live PASS | NOT_RUN / NOT_RUN |
+
+All of the above `NOT_RUN` items require the Owner's separate, explicit approval (including live-call ceilings) before they can be executed. No live inference, Sandbox creation or policy change was performed.
