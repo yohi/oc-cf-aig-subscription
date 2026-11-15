@@ -168,33 +168,53 @@ export async function startServe(config, { fetch: fetchImpl = globalThis.fetch }
   return { server, capability, stop };
 }
 
-async function runLogin(config) {
-  const source = createSIWCSource({ credentialPath: config.credentialPath });
-  const { url, complete } = await source.beginLogin({ newAccount: config.newAccount, includeIdTokenHint: config.includeIdTokenHint });
-  if (config.includeIdTokenHint && !process.stderr.isTTY) {
+export async function runLogin(config, { stderr = process.stderr, createSource = createSIWCSource } = {}) {
+  // Refuse before any callback listener exists.
+  if (config.includeIdTokenHint && !stderr.isTTY) {
     throw new SIWCError("refused", "id_token_hint URL is sensitive; refusing to write it to a non-terminal");
   }
-  process.stderr.write(`Open this URL in a browser that can reach the loopback callback (SSH -L forward if remote):\n${url}\n`);
+  const source = createSource({ credentialPath: config.credentialPath });
+  const { url, complete } = await source.beginLogin({ newAccount: config.newAccount, includeIdTokenHint: config.includeIdTokenHint });
+  stderr.write(`Open this URL in a browser that can reach the loopback callback (SSH -L forward if remote):\n${url}\n`);
   await complete();
-  process.stderr.write("SIWC login complete.\n");
+  stderr.write("SIWC login complete.\n");
 }
 
-async function runServe(config) {
-  // Validate the handoff FD before doing anything else.
+/**
+ * Serve and hand the capability to the launcher over an inherited FIFO/socket
+ * FD only (regular files would persist the bearer). On handoff failure the
+ * broker is stopped and the call rejects.
+ */
+export async function runServe(config, { stderr = process.stderr, signals = true, startServe: start = startServe, fetch: fetchImpl } = {}) {
+  let st;
   try {
-    fs.fstatSync(config.capabilityFd);
+    st = fs.fstatSync(config.capabilityFd);
   } catch {
     throw new ConfigError(["capability fd is not open"]);
   }
-  const broker = await startServe(config);
-  fs.writeSync(config.capabilityFd, `${broker.capability.token}\n`);
+  if (!st.isFIFO() && !st.isSocket()) throw new ConfigError(["capability fd must be a pipe or socket"]);
+  const broker = await start(config, fetchImpl ? { fetch: fetchImpl } : undefined);
+  try {
+    fs.writeSync(config.capabilityFd, `${broker.capability.token}\n`);
+  } catch {
+    await broker.stop();
+    try {
+      fs.closeSync(config.capabilityFd);
+    } catch {
+      /* already closed */
+    }
+    throw new SIWCError("capability_handoff_failed", "capability handoff failed; broker stopped");
+  }
   fs.closeSync(config.capabilityFd);
-  process.stderr.write(`host-broker listening on ${BIND_HOST}:${broker.server.address().port} (foreground; Ctrl-C to stop)\n`);
-  const shutdown = () => {
-    broker.stop().finally(() => process.exit(0));
-  };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  stderr.write(`host-broker listening on ${BIND_HOST}:${broker.server.address().port} (foreground; Ctrl-C to stop)\n`);
+  if (signals) {
+    const shutdown = () => {
+      broker.stop().finally(() => process.exit(0));
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  }
+  return broker;
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env) {

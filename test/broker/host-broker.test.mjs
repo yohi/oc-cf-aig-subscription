@@ -6,7 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { parseConfig, ConfigError, startServe } from "../../bin/host-broker.mjs";
+import { parseConfig, ConfigError, startServe, runLogin, runServe } from "../../bin/host-broker.mjs";
 import { createCredentialStore } from "../../src/broker/credential-store.mjs";
 
 const BIN = fileURLToPath(new URL("../../bin/host-broker.mjs", import.meta.url));
@@ -189,5 +189,113 @@ test("startServe binds 127.0.0.1 only, mints a capability and serves /health (of
     assert.equal(res, 200);
   } finally {
     await broker.stop();
+  }
+});
+
+function seedAccount(cred) {
+  const store = createCredentialStore({ path: cred });
+  store.ensureHostId();
+  store.putAccount(
+    {
+      issuer: "https://auth.openai.com",
+      subject: "user-1",
+      client_id: "issued",
+      scopes: ["openid", "profile", "email", "offline_access", "resource.invoke", "chatgpt.tokens.use.direct"],
+      id_token: "id",
+      access_token: "acc",
+      refresh_token: "ref",
+      token_type: "Bearer",
+      expires_at: Date.now() + 3600_000,
+    },
+    { activate: true },
+  );
+}
+
+function mkfifo() {
+  const p = path.join(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "oc2-fifo-"))), "cap");
+  const r = spawnSync("mkfifo", ["-m", "600", p]);
+  assert.equal(r.status, 0, "mkfifo available");
+  const reader = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  const writer = fs.openSync(p, fs.constants.O_WRONLY);
+  return { reader, writer };
+}
+
+test("login: id_token_hint refusal on non-TTY happens before the callback server starts", async () => {
+  let began = false;
+  const writes = [];
+  await assert.rejects(
+    runLogin(
+      { mode: "login", credentialPath: credPath(), newAccount: false, includeIdTokenHint: true },
+      { stderr: { isTTY: false, write: (s) => writes.push(s) }, createSource: () => ({ beginLogin: async () => ((began = true), { url: "x", complete: async () => {}, cancel: async () => {} }) }) },
+    ),
+    (e) => e.code === "refused",
+  );
+  assert.equal(began, false);
+  assert.equal(writes.join(""), "");
+});
+
+test("serve: refuses a regular-file capability fd before listening", async () => {
+  const cred = credPath();
+  seedAccount(cred);
+  const filePath = path.join(path.dirname(path.dirname(cred)), "cap.txt");
+  const fd = fs.openSync(filePath, "w", 0o600);
+  let started = false;
+  try {
+    const c = parseConfig({ argv: serveArgv(cred), env: baseEnv });
+    await assert.rejects(
+      runServe({ ...c, port: 0, capabilityFd: fd }, { signals: false, startServe: async () => ((started = true), assert.fail("must not start")) }),
+      (e) => e instanceof ConfigError,
+    );
+  } finally {
+    fs.closeSync(fd);
+  }
+  assert.equal(started, false);
+  assert.equal(fs.readFileSync(filePath, "utf8"), "");
+});
+
+test("serve: hands the capability over a FIFO fd only, then closes it", async () => {
+  const cred = credPath();
+  seedAccount(cred);
+  const { reader, writer } = mkfifo();
+  const c = parseConfig({ argv: serveArgv(cred), env: baseEnv });
+  const writes = [];
+  const broker = await runServe({ ...c, port: 0, capabilityFd: writer }, { signals: false, stderr: { write: (s) => writes.push(s) }, fetch: async () => assert.fail("network") });
+  try {
+    const buf = Buffer.alloc(256);
+    const n = fs.readSync(reader, buf, 0, 256, null);
+    const token = buf.subarray(0, n).toString().trim();
+    assert.equal(token, broker.capability.token);
+    assert.throws(() => fs.fstatSync(writer), "writer fd closed after handoff");
+    assert.ok(!writes.join("").includes(token), "capability not logged");
+  } finally {
+    await broker.stop();
+    fs.closeSync(reader);
+  }
+});
+
+test("serve: capability write failure stops the broker and rejects", async () => {
+  const cred = credPath();
+  seedAccount(cred);
+  const { reader, writer } = mkfifo();
+  fs.closeSync(reader); // no reader => EPIPE on write
+  const c = parseConfig({ argv: serveArgv(cred), env: baseEnv });
+  let broker;
+  await assert.rejects(
+    runServe(
+      { ...c, port: 0, capabilityFd: writer },
+      {
+        signals: false,
+        stderr: { write() {} },
+        startServe: async (cfg) => (broker = await startServe(cfg, { fetch: async () => assert.fail("network") })),
+      },
+    ),
+    (e) => e.code === "capability_handoff_failed",
+  );
+  assert.ok(broker, "broker had started");
+  assert.equal(broker.server.listening, false, "broker stopped after failed handoff");
+  try {
+    fs.closeSync(writer);
+  } catch {
+    /* already closed */
   }
 });
