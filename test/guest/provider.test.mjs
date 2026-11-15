@@ -61,6 +61,7 @@ test("package.json keeps Host root export, adds optional ./guest import and pins
   assert.equal(pkg.exports["./guest"], "./src/guest/index.js");
   assert.equal(pkg.dependencies["@opencode/ai"], "2.2.5");
   assert.equal(pkg.dependencies["@opencode/plugin"], "2.2.5");
+  assert.equal(pkg.devDependencies.effect, JSON.parse(fs.readFileSync(path.join(ROOT, "node_modules/effect/package.json"), "utf8")).version, "tests import effect directly");
   assert.match(pkg.scripts.check, /node --check src\/guest\/index\.js/);
   assert.match(pkg.scripts.check, /node --check src\/guest\/provider\.mjs/);
   assert.match(pkg.scripts.check, /node --check bin\/guest-launch\.mjs/);
@@ -130,7 +131,7 @@ test("acceptance mode freezes for the process lifetime", async () => {
   await fresh.setupGuest(a.ctx, guestEnv({ OC_CF_AIG_ACCEPTANCE_MODE: "m1" }));
   assert.ok(a.providers.has(PROVIDER_ID));
   const b = createFakeCore();
-  await fresh.setupGuest(b.ctx, guestEnv({ OC_CF_AIG_ACCEPTANCE_MODE: "m2", OC_CF_AIG_GUEST_FIXTURE_ROOT: fixtureRoot() }));
+  await assert.rejects(fresh.setupGuest(b.ctx, guestEnv({ OC_CF_AIG_ACCEPTANCE_MODE: "m2", OC_CF_AIG_GUEST_FIXTURE_ROOT: fixtureRoot() })), /STOP/);
   assert.equal(b.providers.has(PROVIDER_ID), false);
   await assert.rejects(b.runHook("model.request", { kind: "primary", model: { id: MODEL_ID, providerID: PROVIDER_ID }, headers: {} }, PROVIDER_ID), /refused|blocked/i);
 });
@@ -163,12 +164,12 @@ test("capability must be a Broker-minted ocb_ bearer, never an API key", () => {
 
 // ---------------------------------------------------------------- startup fail-closed
 
-test("absent/unknown mode fails closed before inference: no provider, no tool, all model requests refused", async () => {
+test("absent/unknown mode STOPs Guest initialization (setup throws); refusal hooks remain as defense in depth", async () => {
   for (const mode of [undefined, "", "m3", "M2"]) {
     const core = createFakeCore();
     const env = guestEnv({ OC_CF_AIG_ACCEPTANCE_MODE: mode });
     if (mode === undefined) delete env.OC_CF_AIG_ACCEPTANCE_MODE;
-    await setupGuest(core.ctx, env, { freezeMode: parseAcceptanceMode });
+    await assert.rejects(setupGuest(core.ctx, env, { freezeMode: parseAcceptanceMode }), /Guest initialization STOP/);
     assert.equal(core.providers.has(PROVIDER_ID), false);
     assert.equal(core.calls.toolTransform, 0);
     for (const providerID of [PROVIDER_ID, "openai", "anthropic"]) {
@@ -178,14 +179,31 @@ test("absent/unknown mode fails closed before inference: no provider, no tool, a
   }
 });
 
-test("invalid Broker URL or capability fails closed in both modes", async () => {
+test("invalid Broker URL or capability STOPs Guest initialization in both modes", async () => {
   for (const extra of [{ OC_CF_AIG_BROKER_URL: "https://api.openai.com/v1" }, { OC_CF_AIG_BROKER_CAPABILITY: "sk-test" }, { OC_CF_AIG_BROKER_CAPABILITY: undefined }]) {
     for (const mode of ["m1", "m2"]) {
       const core = createFakeCore();
-      await setupGuest(core.ctx, guestEnv({ OC_CF_AIG_ACCEPTANCE_MODE: mode, ...extra }), { freezeMode: parseAcceptanceMode });
+      await assert.rejects(setupGuest(core.ctx, guestEnv({ OC_CF_AIG_ACCEPTANCE_MODE: mode, ...extra }), { freezeMode: parseAcceptanceMode }), /Guest initialization STOP/);
       assert.equal(core.providers.has(PROVIDER_ID), false);
       await assert.rejects(core.runHook("model.request", { kind: "primary", model: { id: MODEL_ID, providerID: PROVIDER_ID }, headers: {} }, PROVIDER_ID), /refused|blocked/i);
     }
+  }
+});
+
+test("provider registration failure (pre-existing oc-cf-aig) STOPs Guest initialization", async () => {
+  const core = createFakeCore();
+  core.providers.set(PROVIDER_ID, { provider: { id: PROVIDER_ID, name: "hostile", activation: "enabled", package: "x" }, models: new Map() });
+  await assert.rejects(setupGuest(core.ctx, guestEnv(), { freezeMode: parseAcceptanceMode }), /Guest initialization STOP/);
+});
+
+test("real directory-loaded plugin setup throws on missing mode (Plugin init STOP)", async () => {
+  const mod = await Host.load(Host.resolve({ directory: GUEST_DIR }).server);
+  const saved = process.env.OC_CF_AIG_ACCEPTANCE_MODE;
+  delete process.env.OC_CF_AIG_ACCEPTANCE_MODE;
+  try {
+    await assert.rejects(mod.default.setup(createFakeCore().ctx), /Guest initialization STOP/);
+  } finally {
+    if (saved !== undefined) process.env.OC_CF_AIG_ACCEPTANCE_MODE = saved;
   }
 });
 
@@ -364,4 +382,29 @@ test("fixture reader confines reads to the disposable fixture root", async () =>
   }
   assert.throws(() => createFixtureReader({ root: "relative" }), /fixture root/i);
   assert.throws(() => createFixtureReader({ root: path.join(root, "fixture.txt") }), /fixture root/i);
+});
+
+test("fixture reader refuses a FIFO without hanging", async () => {
+  const root = fixtureRoot();
+  const { execFileSync } = await import("node:child_process");
+  execFileSync("mkfifo", [path.join(root, "pipe")]);
+  const read = createFixtureReader({ root });
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("HANG")), 2000).unref());
+  await assert.rejects(Promise.race([read({ path: "pipe" }), timeout]), /fixture/i);
+});
+
+test("fixture reader re-checks the opened handle stays under root (intermediate dir swap race)", async () => {
+  const root = fixtureRoot();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "guest-outside-"));
+  fs.mkdirSync(path.join(outside, "sub"));
+  fs.writeFileSync(path.join(outside, "sub", "nested.txt"), "SECRET");
+  // Swap sub -> symlink to outside after the component lstat checks but before open.
+  const read = createFixtureReader({
+    root,
+    beforeOpen: () => {
+      fs.renameSync(path.join(root, "sub"), path.join(root, "sub.orig"));
+      fs.symlinkSync(path.join(outside, "sub"), path.join(root, "sub"));
+    },
+  });
+  await assert.rejects(read({ path: "sub/nested.txt" }), /fixture/i);
 });

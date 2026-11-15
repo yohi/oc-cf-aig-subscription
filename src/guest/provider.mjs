@@ -117,7 +117,7 @@ export function buildModelInfo() {
 const fixtureError = (message) => new Error(`fixture read refused: ${message}`);
 
 /** Read-only, bounded UTF-8 reader confined to one disposable fixture root. Symlinks are never followed. */
-export function createFixtureReader({ root, maxBytes = MAX_FIXTURE_BYTES } = {}) {
+export function createFixtureReader({ root, maxBytes = MAX_FIXTURE_BYTES, beforeOpen } = {}) {
   if (typeof root !== "string" || !path.isAbsolute(root)) throw new Error("Guest fixture root must be an absolute directory");
   let realRoot;
   try {
@@ -147,15 +147,31 @@ export function createFixtureReader({ root, maxBytes = MAX_FIXTURE_BYTES } = {})
       }
       if (st.isSymbolicLink()) throw fixtureError("symlinks are not followed");
     }
+    // beforeOpen is a test-only seam to simulate a concurrent path swap.
+    if (typeof beforeOpen === "function") await beforeOpen();
     let handle;
     try {
-      handle = await fsp.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      // O_NONBLOCK: a FIFO/device in the fixture root must not block the open.
+      handle = await fsp.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch {
       throw fixtureError("fixture not readable");
     }
     try {
       const st = await handle.stat();
       if (!st.isFile()) throw fixtureError("not a regular file");
+      // Post-open containment: the opened inode must be the one the in-root real path names now
+      // (closes the intermediate-directory swap race between the lstat walk and open).
+      let resolved;
+      let named;
+      try {
+        resolved = await fsp.realpath(target);
+        named = await fsp.stat(resolved);
+      } catch {
+        throw fixtureError("fixture changed during read");
+      }
+      if (!resolved.startsWith(realRoot + path.sep) || named.dev !== st.dev || named.ino !== st.ino) {
+        throw fixtureError("opened file is outside the fixture root");
+      }
       if (st.size > maxBytes) throw fixtureError("fixture too large");
       const buf = Buffer.alloc(st.size);
       const { bytesRead } = await handle.read(buf, 0, st.size, 0);
@@ -287,8 +303,9 @@ async function installRefusal(ctx, reason) {
 
 /**
  * Plugin entry logic. Reads only the Guest's own process-local OC_CF_AIG_* variables.
- * Any invalid setting registers no provider/tool and blocks all inference. Setup does
- * not throw, so the refusal hooks stay active for the process lifetime.
+ * Any invalid setting or registration failure registers no provider/tool and STOPs Guest
+ * initialization by throwing. Refusal hooks are installed first as defense in depth only
+ * (whether Core keeps them after a failed setup is NOT_VERIFIED).
  */
 export async function setupGuest(ctx, env = process.env, { freezeMode = freezeAcceptanceMode } = {}) {
   let mode;
@@ -300,12 +317,13 @@ export async function setupGuest(ctx, env = process.env, { freezeMode = freezeAc
     capability = validateCapability(env[ENV.capability]);
   } catch {
     await installRefusal(ctx, "invalid Guest configuration");
-    return;
+    throw new Error("Guest initialization STOP: invalid or missing Guest configuration");
   }
   const fixtureRoot = mode === "m2" ? env[ENV.fixtureRoot] : undefined;
   try {
     await registerGuestProvider(ctx, { brokerURL, capability, mode, fixtureRoot });
   } catch {
     await installRefusal(ctx, "Guest provider registration failed");
+    throw new Error("Guest initialization STOP: Guest provider registration failed");
   }
 }
