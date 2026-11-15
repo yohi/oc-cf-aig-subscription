@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import net from "node:net";
 import assert from "node:assert/strict";
 import { createCapabilityStore } from "../../src/broker/capabilities.mjs";
 import { parseBrokerRequest } from "../../src/broker/policy.mjs";
@@ -400,6 +401,7 @@ for (const [label, respond] of Object.entries(failures)) {
       await eventually(() => assert.equal(h.releases.count, 1));
       await new Promise((r) => setTimeout(r, 30));
       assert.equal(h.releases.count, 1);
+      assert.equal(h.store.describe()[0].active, 0);
     } finally { await h.done(); }
   });
 }
@@ -421,7 +423,34 @@ test("SSE failure: request duration limit aborts a hung stream", async () => {
     assert.equal(out.success, false);
     await eventually(() => assert.equal(h.fetches[0].init.signal.aborted, true));
     await eventually(() => assert.equal(h.releases.count, 1));
+    assert.equal(h.store.describe()[0].active, 0);
   } finally { await h.done(); }
+});
+
+test("stalled non-reading client + duration/revoke abort closes the connection and releases Permit", async () => {
+  for (const mode of ["duration", "revoke"]) {
+    const big = sseEvent(OK_EVENTS[0]) + sseEvent({ type: "response.output_text.delta", delta: "x".repeat(8 * 1024 * 1024) });
+    const h = await harness({
+      cap: { maxRequestDurationMs: mode === "duration" ? 300 : 10_000, maxResponseBytes: 64 * 1024 * 1024 },
+      respond: () => sseResponse(big, { hang: true }),
+    });
+    const body = JSON.stringify(m1a());
+    const sock = net.connect(h.server.address().port, "127.0.0.1");
+    sock.pause();
+    sock.on("error", () => {});
+    sock.write(`POST /v1/responses HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\nauthorization: Bearer ${h.token}\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+    try {
+      await eventually(() => assert.equal(h.fetches.length, 1));
+      await new Promise((r) => setTimeout(r, 100));
+      if (mode === "revoke") h.store.revoke(h.id);
+      await eventually(() => assert.equal(h.releases.count, 1), 3000);
+      await eventually(() => assert.equal(h.store.describe()[0].active, 0));
+      await eventually(() => assert.equal(h.fetches[0].init.signal.aborted, true));
+      const conns = () => new Promise((resolve) => h.server.getConnections((_, n) => resolve(n)));
+      for (let i = 0; i < 100 && (await conns()) !== 0; i++) await new Promise((r) => setTimeout(r, 20));
+      assert.equal(await conns(), 0, "server closed the stalled connection");
+    } finally { sock.destroy(); await h.done(); }
+  }
 });
 
 test("SSE failure: client abort aborts upstream and releases Permit once", async () => {
@@ -499,6 +528,8 @@ test("createCloudflareUpstream validates gatewayBase and never forwards redirect
     `https://gateway.ai.cloudflare.com/v1/${ACCOUNT.toUpperCase()}/gw`,
     `https://user@gateway.ai.cloudflare.com/v1/${ACCOUNT}/gw`,
     `https://gateway.ai.cloudflare.com/v1/${ACCOUNT}/gw?x=1`,
+    `https://gateway.ai.cloudflare.com/v1/${ACCOUNT}/.`,
+    `https://gateway.ai.cloudflare.com/v1/${ACCOUNT}/..`,
   ]) {
     assert.throws(() => createCloudflareUpstream({ gatewayBase: bad, gatewayToken: "g", credentialSource: cred, fetchImpl: async () => {} }), undefined, bad);
   }

@@ -129,7 +129,11 @@ export function createBrokerServer({ capabilities, parseRequest, upstream, limit
       permit.release();
     };
     const ac = new AbortController();
-    const abort = () => { if (!ac.signal.aborted) ac.abort(); };
+    const abort = () => {
+      if (!ac.signal.aborted) ac.abort();
+      // A stalled client must not keep the handler (and Permit) alive once aborted.
+      if (res.headersSent && !res.destroyed) res.destroy();
+    };
     permit.signal?.addEventListener("abort", abort, { once: true });
     if (permit.signal?.aborted) abort();
     res.on("close", () => {

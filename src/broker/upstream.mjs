@@ -14,7 +14,7 @@ function headerSafe(value, name) {
  * except the validated, rebuilt JSON body.
  */
 export function createCloudflareUpstream({ gatewayBase, gatewayToken, credentialSource, fetchImpl = globalThis.fetch }) {
-  if (typeof gatewayBase !== "string" || !GATEWAY_BASE.test(gatewayBase)) throw new TypeError("invalid gatewayBase");
+  if (typeof gatewayBase !== "string" || !GATEWAY_BASE.test(gatewayBase) || /\/\.{1,2}$/.test(gatewayBase)) throw new TypeError("invalid gatewayBase");
   headerSafe(gatewayToken, "gatewayToken");
   if (typeof credentialSource?.getAccessToken !== "function") throw new TypeError("credentialSource required");
   if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl required");
