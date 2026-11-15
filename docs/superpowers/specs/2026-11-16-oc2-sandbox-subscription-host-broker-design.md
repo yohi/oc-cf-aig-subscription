@@ -130,8 +130,9 @@ Claude Agent Provider has previously traversed Cloudflare AI Gateway from a host
 ## 9. Acceptance and stop conditions
 
 **Acceptance (M1, narrow technical demonstration):**
-- Sandbox-initiated `openai/gpt-6-luna` or dedicated provider alias yields exactly `gateway-ok`.
-- Cloudflare Gateway's `custom-openai-public-probe/v1/responses` records HTTP 200 for a matching request.
+- **Only** the explicitly selected Guest OpenCode provider/model `oc-cf-aig/gpt-6-luna` qualifies. From the disposable Sandbox, the Guest sends `Reply with exactly: gateway-ok` and receives exactly `gateway-ok` through **Guest → Host Broker → Cloudflare AI Gateway → SIWC Responses**.
+- The **same correlated** request has Cloudflare Gateway `custom-openai-public-probe/v1/responses` HTTP 200, upstream `store:false` and `stream:true`, a terminal `response.completed` event, and orderly SSE completion. HTTP 200 or a partial text delta alone is **not** M1 PASS.
+- A successful request through the ordinary `openai/gpt-6-luna` provider (or any other forbidden provider, direct OpenAI/BYOK route or fallback) **never** counts as M1 PASS. If forbidden-provider/direct-route inference **succeeds**, record a **Fail-Closed violation and STOP** regardless of response text or Gateway status.
 - Guest has no OAuth or Cloudflare credentials in environment, files, command arguments, or writable mounts; Host-only credential store remains inaccessible from guest.
 - Denied direct model host requests, unauthorized provider/model/path/capability, exceeded budget, and Broker stop yield errors rather than fallback.
 - Host Broker processes **model inference only**; it cannot invoke host shell or workspace tools.
