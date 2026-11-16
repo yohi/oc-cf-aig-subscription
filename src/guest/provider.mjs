@@ -120,10 +120,13 @@ const fixtureError = (message) => new Error(`fixture read refused: ${message}`);
 export function createFixtureReader({ root, maxBytes = MAX_FIXTURE_BYTES, beforeOpen } = {}) {
   if (typeof root !== "string" || !path.isAbsolute(root)) throw new Error("Guest fixture root must be an absolute directory");
   let realRoot;
+  let rootFd;
   try {
     realRoot = fs.realpathSync(root);
-    if (!fs.statSync(realRoot).isDirectory()) throw new Error("not a directory");
+    rootFd = fs.openSync(realRoot, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    if (!fs.fstatSync(rootFd).isDirectory()) throw new Error("not a directory");
   } catch {
+    if (rootFd !== undefined) fs.closeSync(rootFd);
     throw new Error("Guest fixture root must be an existing absolute directory");
   }
   return async function readFixture(input) {
@@ -136,42 +139,36 @@ export function createFixtureReader({ root, maxBytes = MAX_FIXTURE_BYTES, before
     }
     const target = path.resolve(realRoot, rel);
     if (!target.startsWith(realRoot + path.sep)) throw fixtureError("path escapes the fixture root");
-    let current = realRoot;
-    for (const segment of path.relative(realRoot, target).split(path.sep)) {
-      current = path.join(current, segment);
-      let st;
-      try {
-        st = await fsp.lstat(current);
-      } catch {
-        throw fixtureError("fixture not found");
-      }
-      if (st.isSymbolicLink()) throw fixtureError("symlinks are not followed");
-    }
-    // beforeOpen is a test-only seam to simulate a concurrent path swap.
-    if (typeof beforeOpen === "function") await beforeOpen();
+    const segments = path.relative(realRoot, target).split(path.sep);
+    const directoryHandles = [];
+    let parentFd = rootFd;
     let handle;
     try {
-      // O_NONBLOCK: a FIFO/device in the fixture root must not block the open.
-      handle = await fsp.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-    } catch {
-      throw fixtureError("fixture not readable");
-    }
-    try {
+      for (const segment of segments.slice(0, -1)) {
+        const directoryPath = path.join("/proc/self/fd", String(parentFd), segment);
+        let directory;
+        try {
+          directory = await fsp.open(
+            directoryPath,
+            fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+          );
+        } catch {
+          throw fixtureError("fixture not readable");
+        }
+        directoryHandles.push(directory);
+        parentFd = directory.fd;
+      }
+      // The opened directory descriptors pin each traversed component. The
+      // final name is resolved from that descriptor, never from the mutable root path.
+      if (typeof beforeOpen === "function") await beforeOpen();
+      const targetPath = path.join("/proc/self/fd", String(parentFd), segments.at(-1));
+      try {
+        handle = await fsp.open(targetPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      } catch {
+        throw fixtureError("fixture not readable");
+      }
       const st = await handle.stat();
       if (!st.isFile()) throw fixtureError("not a regular file");
-      // Post-open containment: the opened inode must be the one the in-root real path names now
-      // (closes the intermediate-directory swap race between the lstat walk and open).
-      let resolved;
-      let named;
-      try {
-        resolved = await fsp.realpath(target);
-        named = await fsp.stat(resolved);
-      } catch {
-        throw fixtureError("fixture changed during read");
-      }
-      if (!resolved.startsWith(realRoot + path.sep) || named.dev !== st.dev || named.ino !== st.ino) {
-        throw fixtureError("opened file is outside the fixture root");
-      }
       if (st.size > maxBytes) throw fixtureError("fixture too large");
       const buf = Buffer.alloc(st.size);
       const { bytesRead } = await handle.read(buf, 0, st.size, 0);
@@ -183,7 +180,8 @@ export function createFixtureReader({ root, maxBytes = MAX_FIXTURE_BYTES, before
       }
       return { content };
     } finally {
-      await handle.close();
+      await handle?.close();
+      await Promise.all(directoryHandles.map((directory) => directory.close()));
     }
   };
 }

@@ -393,18 +393,22 @@ test("fixture reader refuses a FIFO without hanging", async () => {
   await assert.rejects(Promise.race([read({ path: "pipe" }), timeout]), /fixture/i);
 });
 
-test("fixture reader re-checks the opened handle stays under root (intermediate dir swap race)", async () => {
+test("fixture reader remains anchored to the opened directory across repeated path swaps", async () => {
   const root = fixtureRoot();
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), "guest-outside-"));
   fs.mkdirSync(path.join(outside, "sub"));
   fs.writeFileSync(path.join(outside, "sub", "nested.txt"), "SECRET");
-  // Swap sub -> symlink to outside after the component lstat checks but before open.
+  fs.writeFileSync(path.join(root, "sub", "nested.txt"), "inside");
   const read = createFixtureReader({
     root,
     beforeOpen: () => {
       fs.renameSync(path.join(root, "sub"), path.join(root, "sub.orig"));
       fs.symlinkSync(path.join(outside, "sub"), path.join(root, "sub"));
+      fs.unlinkSync(path.join(root, "sub"));
+      fs.renameSync(path.join(root, "sub.orig"), path.join(root, "sub"));
+      fs.renameSync(path.join(root, "sub"), path.join(root, "sub.orig"));
+      fs.symlinkSync(path.join(outside, "sub"), path.join(root, "sub"));
     },
   });
-  await assert.rejects(read({ path: "sub/nested.txt" }), /fixture/i);
+  assert.deepEqual(await read({ path: "sub/nested.txt" }), { content: "inside" });
 });
