@@ -306,6 +306,7 @@ export function createCredentialStore({
   }
 
   const guardPath = `${lockPath}.reclaim`;
+  const recoveryPath = `${guardPath}.recovery`;
 
   function readLockInfo(p = lockPath) {
     let fd;
@@ -417,9 +418,29 @@ export function createCredentialStore({
   function reclaim(info, token) {
     const guardIno = publish(guardPath, selfRecord(token), token);
     if (guardIno === null) {
-      // Guard held: wait, unless its holder is certainly dead (crashed mid-reclaim).
+      // A dead guard is removed only while holding a second, non-recoverable
+      // recovery mutex. If that mutex's owner crashes, fail closed rather than
+      // allowing two waiters to race its unlink.
       const g = readLockInfo(guardPath);
-      if (g && ownerState(g) === "dead") unlinkIfDead(guardPath, g);
+      if (g && ownerState(g) === "dead") {
+        let recoveryIno;
+        try {
+          fs.mkdirSync(recoveryPath, { mode: 0o700 });
+          recoveryIno = fs.lstatSync(recoveryPath).ino;
+        } catch (e) {
+          if (e.code !== "EEXIST") fail("lock_failed", "credential lock recovery is unavailable");
+          return;
+        }
+        try {
+          unlinkIfDead(guardPath, g);
+        } finally {
+          try {
+            if (fs.lstatSync(recoveryPath).ino === recoveryIno) fs.rmdirSync(recoveryPath);
+          } catch {
+            /* keep recovery fail-closed if ownership changed or cleanup failed */
+          }
+        }
+      }
       return;
     }
     try {

@@ -302,6 +302,16 @@ function exited(child) {
   return new Promise((resolve) => (child.exitCode !== null ? resolve(child.exitCode) : child.on("exit", (c) => resolve(c))));
 }
 
+async function eventually(fn, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { return fn(); } catch (e) {
+      if (Date.now() >= deadline) throw e;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+}
+
 /** Spawn a child that holds the lock for `holdMs`; resolves once it reports holding it. */
 async function lockHolderChild(file, holdMs) {
   const child = spawnNode(
@@ -429,6 +439,78 @@ test("M-6: reclaim race: several waiter processes reclaim a dead lock and hold i
   }
   assert.ok(!fs.existsSync(`${file}.lock`));
   assert.deepEqual(fs.readdirSync(dir).filter((n) => n !== "siwc.json"), [], "no guard/temp files left");
+});
+
+test("dead reclaim-guard recovery is serialized before the main lock can be reclaimed", async () => {
+  const { dir, file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]);
+  fs.writeFileSync(`${file}.lock`, JSON.stringify({ pid: Number(String(dead.stdout)), start: "1", token: "dead-main" }), { mode: 0o600 });
+  fs.writeFileSync(`${file}.lock.reclaim`, JSON.stringify({ pid: Number(String(dead.stdout)), start: "1", token: "dead-guard" }), { mode: 0o600 });
+  const root = path.dirname(dir);
+  const log = path.join(root, "guard-recovery.log");
+  const go = path.join(root, "guard-recovery.go");
+  const hold = (name) => path.join(root, `${name}.hold`);
+  const entered = (name) => path.join(root, `${name}.entered`);
+  const gate = path.join(root, "paused-guard-unlink");
+  const resume = path.join(root, "resume-guard-unlink");
+  fs.writeFileSync(log, "");
+  const childSource = `
+    import fs from "node:fs";
+    import { createCredentialStore } from ${JSON.stringify(MOD_URL)};
+    const [file, log, go, name, root, gate, resume, pause] = process.argv.slice(1);
+    if (pause === "yes") {
+      const unlink = fs.unlinkSync;
+      let paused = false;
+      fs.unlinkSync = (target) => {
+        if (!paused && target === file + ".lock.reclaim" && JSON.parse(fs.readFileSync(target, "utf8")).token === "dead-guard") {
+          paused = true;
+          fs.writeFileSync(gate, "");
+          while (!fs.existsSync(resume)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+        }
+        return unlink(target);
+      };
+    }
+    fs.writeFileSync(root + "/" + name + ".started", "");
+    while (!fs.existsSync(go)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+    const store = createCredentialStore({ path: file, lockPollMs: 2, lockTimeoutMs: 5000 });
+    await store.withLock(async () => {
+      fs.appendFileSync(log, name + ":in\\n");
+      fs.writeFileSync(root + "/" + name + ".entered", "");
+      while (!fs.existsSync(root + "/" + name + ".hold")) await new Promise(r => setTimeout(r, 2));
+      fs.appendFileSync(log, name + ":out\\n");
+    });`;
+  const spawnWaiter = (name, pause) => spawnNode(childSource, [file, log, go, name, root, gate, resume, pause ? "yes" : "no"]);
+  const children = [spawnWaiter("a", true)];
+  try {
+    await eventually(() => assert.ok(fs.existsSync(path.join(root, "a.started"))));
+    fs.writeFileSync(go, "");
+    await eventually(() => assert.ok(fs.existsSync(gate)));
+    children.push(spawnWaiter("b", false));
+    await eventually(() => assert.ok(fs.existsSync(path.join(root, "b.started"))));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(fs.existsSync(entered("b")), false, "another waiter cannot pass a held guard-recovery gate");
+    fs.writeFileSync(resume, "");
+    await eventually(() => assert.ok(fs.existsSync(entered("a")) || fs.existsSync(entered("b"))));
+    const first = fs.existsSync(entered("a")) ? "a" : "b";
+    const second = first === "a" ? "b" : "a";
+    fs.writeFileSync(hold(first), "");
+    await eventually(() => assert.ok(fs.existsSync(entered(second))));
+    fs.writeFileSync(hold(second), "");
+    assert.deepEqual(await Promise.all(children.map(exited)), [0, 0]);
+  } finally {
+    fs.writeFileSync(resume, "");
+    fs.writeFileSync(hold("a"), "");
+    fs.writeFileSync(hold("b"), "");
+    for (const child of children) if (child.exitCode === null) child.kill("SIGKILL");
+  }
+  const lines = fs.readFileSync(log, "utf8").trim().split("\n");
+  assert.equal(lines.length, 4);
+  const firstOwner = lines[0].split(":")[0];
+  const secondOwner = lines[2].split(":")[0];
+  assert.notEqual(firstOwner, secondOwner);
+  assert.deepEqual(lines, [`${firstOwner}:in`, `${firstOwner}:out`, `${secondOwner}:in`, `${secondOwner}:out`]);
+  assert.ok(!fs.existsSync(`${file}.lock`));
 });
 
 test("M-6: multi-process read-modify-write under withLock is serialized (no lost updates)", async () => {
