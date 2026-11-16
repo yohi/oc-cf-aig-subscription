@@ -25,6 +25,7 @@ export function createCloudflareUpstream({ gatewayBase, gatewayToken, credential
     const body = { model: parsed.model, input: parsed.input, stream: true, store: false };
     if (parsed.include) body.include = parsed.include;
     if (parsed.instructions !== undefined) body.instructions = parsed.instructions;
+    if (parsed.text) body.text = { verbosity: parsed.text.verbosity };
     if (parsed.tools) body.tools = parsed.tools;
     return fetchImpl(url, {
       method: "POST",

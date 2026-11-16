@@ -97,7 +97,9 @@ export async function verifyOpencodeVersion(bin, { runVersion = defaultRunVersio
   } catch {
     throw new LaunchError("could not determine OpenCode version");
   }
-  if (!new RegExp(`^v?${OPENCODE_VERSION.replace(/\./g, "\\.")}$`).test(String(out).trim())) {
+  // Accepted outputs (after trimming surrounding whitespace): "2.2.5", "v2.2.5", "opencode v2.2.5" (real Core format).
+  const v = OPENCODE_VERSION.replace(/\./g, "\\.");
+  if (!new RegExp(`^(?:${v}|v${v}|opencode v${v})$`).test(String(out).trim())) {
     throw new LaunchError(`OpenCode version must be exactly ${OPENCODE_VERSION}`);
   }
 }

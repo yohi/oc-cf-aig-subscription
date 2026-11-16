@@ -294,6 +294,19 @@ const negatives = [
   ["prompt_cache_key present", () => m1a({ prompt_cache_key: "abc" }), 400],
   ["prompt_cache_key empty string", () => m1a({ prompt_cache_key: "" }), 400],
   ["tool_choice", () => m2Body() && { ...m2Body(), tool_choice: "auto" }, 400],
+  // Real Core v2.2.5 sends text:{verbosity:"low"}; only that exact shape is admitted.
+  ["text verbosity unknown enum", () => m1a({ text: { verbosity: "extreme" } }), 400],
+  ["text verbosity wrong type", () => m1a({ text: { verbosity: 1 } }), 400],
+  ["text verbosity null", () => m1a({ text: { verbosity: null } }), 400],
+  ["text empty object", () => m1a({ text: {} }), 400],
+  ["text unknown key", () => m1a({ text: { verbosity: "low", extra: true } }), 400],
+  ["text format json_schema", () => m1a({ text: { verbosity: "low", format: { type: "json_schema", name: "x", schema: {} } } }), 400],
+  ["text format only", () => m1a({ text: { format: { type: "text" } } }), 400],
+  ["text null", () => m1a({ text: null }), 400],
+  ["text array", () => m1a({ text: [{ verbosity: "low" }] }), 400],
+  ["text string", () => m1a({ text: "low" }), 400],
+  ["max_output_tokens still rejected with text", () => m1a({ text: { verbosity: "low" }, max_output_tokens: 10 }), 400],
+  ["prompt_cache_key still rejected with text", () => m1a({ text: { verbosity: "low" }, prompt_cache_key: "k" }), 400],
 ];
 
 for (const [label, build, status] of negatives) {
@@ -342,6 +355,27 @@ test("negative: injected Guest headers and oversize headers never reach upstream
 });
 
 // ---------- F-001 A/B positives ----------
+
+test("real-Core text:{verbosity} is admitted and rebuilt from validated content only", async () => {
+  for (const verbosity of ["low", "medium", "high"]) {
+    const h = await harness();
+    try {
+      const text = { verbosity };
+      assert.ok((await outcome(await h.post(m1a({ text })))).success, verbosity);
+      assert.deepEqual(h.fetches[0].body.text, { verbosity });
+      assert.notEqual(h.fetches[0].body.text, text);
+      assert.deepEqual(Object.keys(h.fetches[0].body).sort(), ["include", "input", "model", "store", "stream", "text"].sort());
+    } finally { await h.done(); }
+  }
+});
+
+test("text absent -> no text sent upstream", async () => {
+  const h = await harness();
+  try {
+    assert.ok((await outcome(await h.post(m1a()))).success);
+    assert.ok(!("text" in h.fetches[0].body));
+  } finally { await h.done(); }
+});
 
 test("F-001 A-positive: no prompt_cache_key admitted; B-positive exact strict:false tool admitted", async () => {
   const h = await harness();

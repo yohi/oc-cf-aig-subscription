@@ -48,6 +48,22 @@ test("M1-D / 5b / 5d: real SDK body has no tools, no prompt_cache_key, native M1
   assert.equal(response.text, "gateway-ok");
 });
 
+test("M1 + real-Core text: a real SDK body plus the Core-observed text:{verbosity:\"low\"} is admitted; other text shapes are 400", async () => {
+  broker.script.push(sse(textEvents("gateway-ok")));
+  await runPrimaryTurn(core, { messages: [Message.user("say gateway-ok")], promptCacheKey: "affinity-nonempty-123" });
+  const sdkBody = structuredClone(broker.inbound.at(-1));
+  broker.script.push(sse(textEvents("gateway-ok")));
+  const ok = await broker.postRaw({ ...sdkBody, text: { verbosity: "low" } });
+  assert.equal(ok.status, 200);
+  await ok.text();
+  assert.deepEqual(broker.upstream.at(-1).body.text, { verbosity: "low" });
+  for (const bad of [{ verbosity: "low", format: { type: "text" } }, { verbosity: "loud" }, {}, null]) {
+    const res = await broker.postRaw({ ...sdkBody, text: bad });
+    assert.equal(res.status, 400);
+    await res.text();
+  }
+});
+
 test("M1-E: assistant output_text and encrypted reasoning history replay intact", async () => {
   broker.script.push(sse(textEvents("gateway-ok", { reasoning: "ENC-M1-opaque==" })));
   const user1 = Message.user("say gateway-ok");

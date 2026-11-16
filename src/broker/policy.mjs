@@ -169,6 +169,16 @@ function projectTools(tools) {
   ];
 }
 
+// OpenCode Core v2.2.5 adds text:{verbosity:"low"} to Responses requests. Only that exact shape
+// (single key, OpenAI Responses text.verbosity enum) is admitted; text.format and anything else is refused.
+const TEXT_VERBOSITY = new Set(["low", "medium", "high"]);
+function validateText(text) {
+  if (!isObj(text)) throw bad("text must be an object");
+  checkKeys(text, ["verbosity"], [], "text");
+  if (!isStr(text.verbosity) || !TEXT_VERBOSITY.has(text.verbosity)) throw bad("text.verbosity must be low, medium or high");
+  return { verbosity: text.verbosity };
+}
+
 export function parseBrokerRequest({ method, pathname, headers, body, limits = {} }) {
   if (pathname !== "/v1/responses") throw new PolicyError(404, "not found", "not_found");
   if (method !== "POST") throw new PolicyError(405, "method not allowed", "method_not_allowed");
@@ -185,7 +195,7 @@ export function parseBrokerRequest({ method, pathname, headers, body, limits = {
   }
   if (!isObj(json)) throw bad("body must be a JSON object");
   // Anything not listed here (including prompt_cache_key, previous_response_id, ...) is rejected, never stripped.
-  checkKeys(json, ["model", "input", "stream"], ["store", "include", "instructions", "tools"], "request");
+  checkKeys(json, ["model", "input", "stream"], ["store", "include", "instructions", "tools", "text"], "request");
   if (json.model !== BROKER_MODEL) throw bad("unsupported model");
   if (json.stream !== true) throw bad("stream must be true");
   if ("store" in json && json.store !== false) throw bad("store must be false or absent");
@@ -195,6 +205,7 @@ export function parseBrokerRequest({ method, pathname, headers, body, limits = {
   const parsed = { model: BROKER_MODEL, input: validateInput(json.input), stream: true, store: false };
   if ("include" in json) parsed.include = [DEFAULT_INCLUDE];
   if ("instructions" in json) parsed.instructions = json.instructions;
+  if ("text" in json) parsed.text = validateText(json.text);
   if ("tools" in json) {
     const tools = projectTools(json.tools);
     if (tools) parsed.tools = tools;

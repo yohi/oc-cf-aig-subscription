@@ -75,7 +75,10 @@ test("child env carries the capability only in the child; Host secrets in the la
 test("version verification is injectable and fails closed on anything but OpenCode 2.2.5", async () => {
   await verifyOpencodeVersion("/opt/oc/opencode", { runVersion: async () => "2.2.5\n" });
   await verifyOpencodeVersion("/opt/oc/opencode", { runVersion: async () => "v2.2.5" });
-  for (const v of ["2.2.6", "2.2.5-beta", "opencode 2.2.4", ""]) {
+  // Real Core v2.2.5 prints "opencode v2.2.5" (observed in the Sandbox).
+  await verifyOpencodeVersion("/opt/oc/opencode", { runVersion: async () => "opencode v2.2.5\n" });
+  await verifyOpencodeVersion("/opt/oc/opencode", { runVersion: async () => "  opencode v2.2.5  \n" });
+  for (const v of ["2.2.6", "2.2.5-beta", "opencode 2.2.4", "", "opencode 2.2.5", "opencode v2.2.5\nextra", "x\nopencode v2.2.5", "opencode v2.2.5 beta", "OpenCode v2.2.5", "opencode  v2.2.5"]) {
     await assert.rejects(verifyOpencodeVersion("/opt/oc/opencode", { runVersion: async () => v }), LaunchError, v);
   }
   await assert.rejects(verifyOpencodeVersion("/opt/oc/opencode", { runVersion: async () => { throw new Error("ENOENT"); } }), LaunchError);
