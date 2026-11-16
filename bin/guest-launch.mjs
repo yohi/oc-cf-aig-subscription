@@ -67,11 +67,25 @@ export function parseLaunchArgs(argv) {
   return { mode, brokerURL, capabilityFd, fixtureRoot, opencodeBin, opencodeArgs };
 }
 
+// Credential-like variables are never inherited by the OpenCode child (or the version probe),
+// regardless of how the value looks (sentinel-looking values are NOT treated as safe).
+// This is a child-env filter only: it does not prove Sandbox-wide credential safety.
+const CREDENTIAL_EXACT = new Set(["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK"]);
+const CREDENTIAL_PREFIX = /^(?:GITHUB_|ANTHROPIC_|OPENAI_|CF_|CLOUDFLARE_|AWS_|AZURE_|GOOGLE_|GEMINI_|HF_|NPM_TOKEN)/;
+const CREDENTIAL_SUFFIX = /(?:_TOKEN|_SECRET|_PASSWORD|_API_KEY|_APIKEY|_CREDENTIALS)$/;
+// Names containing TOKEN with a sentinel marker are also dropped (e.g. MCP_SENTINEL_TOKEN_NAME).
+const CREDENTIAL_INFIX = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|CREDENTIALS?)(?:_|$)/;
+function isCredentialLike(name) {
+  if (name.startsWith("GIT_CONFIG_")) return false;
+  const k = name.toUpperCase();
+  return CREDENTIAL_EXACT.has(k) || CREDENTIAL_PREFIX.test(k) || CREDENTIAL_SUFFIX.test(k) || CREDENTIAL_INFIX.test(k);
+}
+
 function baseEnv(parent) {
   for (const k of HOST_ONLY_ENV) {
     if (Object.hasOwn(parent, k) && parent[k] !== undefined) throw new LaunchError(`${k} must not be present in the Guest launcher environment`);
   }
-  return Object.fromEntries(Object.entries(parent).filter(([k, v]) => v !== undefined && !k.startsWith("OC_CF_AIG_")));
+  return Object.fromEntries(Object.entries(parent).filter(([k, v]) => v !== undefined && !k.startsWith("OC_CF_AIG_") && !isCredentialLike(k)));
 }
 
 /** Child-only environment; the launcher's own environment is never modified. */

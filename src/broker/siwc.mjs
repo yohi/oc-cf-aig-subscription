@@ -73,9 +73,11 @@ async function readJson(res) {
  * Official SIWC dynamic-registration credential source. Host-only.
  *
  * `client` injection (all optional): fetch, randomBytes, timeoutMs,
- * refreshSkewMs, loginTimeoutMs, lockPollMs, lockTimeoutMs, lockStaleMs.
+ * refreshSkewMs, loginTimeoutMs, lockPollMs, lockTimeoutMs.
  * There is no API-key, BYOK or alternate-provider path: every renewal failure
- * rejects.
+ * rejects. If a refresh may have rotated the refresh token without the new
+ * set being persisted (crash mid-refresh, save failure), getAccessToken fails
+ * with code `reauth_required` until an interactive login succeeds.
  */
 export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client = {}, clock = Date.now } = {}) {
   if (authBase !== AUTH_BASE) throw new SIWCError("invalid_config", "authBase must be the official SIWC origin");
@@ -92,7 +94,6 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
       path: credentialPath,
       lockPollMs: client.lockPollMs,
       lockTimeoutMs: client.lockTimeoutMs ?? timeoutMs * 2,
-      lockStaleMs: client.lockStaleMs ?? Math.max(60_000, timeoutMs * 4),
     });
   } catch (e) {
     throw new SIWCError("invalid_config", `credential store unavailable (${e.code ?? "error"})`);
@@ -101,6 +102,7 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
   let jwksCache = null; // { keys, fetchedAt }
   let cached = null; // last known record (with key)
   let inflight = null;
+  let needsReauth = false; // set when this process left the store in an uncertain refresh state
 
   async function timedFetch(url, init, timeoutCode, failCode) {
     const ac = new AbortController();
@@ -307,6 +309,7 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
         fail("store_error", `credential store write failed (${e.code ?? "error"})`);
       }
       cached = { ...record, key };
+      needsReauth = false; // fresh token set persisted without refresh marker
       return { issuer: record.issuer, subject: record.subject, identity_label: record.identity_label ?? null };
     }
 
@@ -353,38 +356,69 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
     return false;
   }
 
+  const reauthRequired = () => fail("reauth_required", "credential state uncertain after refresh; explicit re-login required");
+
   async function refresh(key) {
+    if (needsReauth) reauthRequired();
     try {
       return await store.withLock(async () => {
         const latest = store.getAccount(key);
         if (!latest) fail("not_logged_in", "no SIWC account");
+        // Marker seen while WE hold the lock: its writer no longer holds it,
+        // so it crashed or failed to save mid-refresh. The stored refresh
+        // token may already be consumed by rotation: never reuse it.
+        if (latest.refresh_pending_since !== undefined) reauthRequired();
         if (usable(latest, clock())) return { ...latest, key };
-        const body = await postToken({ grant_type: "refresh_token", refresh_token: latest.refresh_token, client_id: latest.client_id, resource: RESOURCE }, "refresh");
-        validateTokenResponse(body, { requireIdToken: false });
-        let scopes = latest.scopes;
-        if (body.scope !== undefined) {
-          scopes = scopesOf(body.scope);
-          if (!hasRequiredScopes(scopes)) fail("insufficient_scope", "refreshed grant lacks required SIWC scopes");
+        // Durable marker before the POST. Doubles as the writability/safety
+        // check: if the store cannot be written, the endpoint is not called
+        // and the current refresh token stays valid.
+        store.putAccount({ ...latest, refresh_pending_since: clock() });
+        let next;
+        try {
+          const body = await postToken({ grant_type: "refresh_token", refresh_token: latest.refresh_token, client_id: latest.client_id, resource: RESOURCE }, "refresh");
+          validateTokenResponse(body, { requireIdToken: false });
+          let scopes = latest.scopes;
+          if (body.scope !== undefined) {
+            scopes = scopesOf(body.scope);
+            if (!hasRequiredScopes(scopes)) fail("insufficient_scope", "refreshed grant lacks required SIWC scopes");
+          }
+          let idToken = latest.id_token;
+          if (body.id_token !== undefined) {
+            const claims = await verifyIdToken(body.id_token, { clientId: latest.client_id, subject: latest.subject });
+            if (claims.iss !== latest.issuer) fail("identity_mismatch", "refreshed identity does not match stored account");
+            idToken = body.id_token;
+          }
+          const now = clock();
+          next = {
+            ...latest,
+            scopes,
+            id_token: idToken,
+            access_token: body.access_token,
+            refresh_token: body.refresh_token,
+            token_type: "Bearer",
+            expires_at: now + body.expires_in * 1000,
+          };
+          delete next.earliest_refresh_at;
+          if (body.earliest_refresh_at !== undefined) next.earliest_refresh_at = body.earliest_refresh_at * 1000;
+        } catch (e) {
+          // No validated new token set was obtained: restore the previous
+          // record (clears the marker). If even that fails the marker stays
+          // and later attempts fail closed with reauth_required.
+          try {
+            store.putAccount(latest);
+          } catch {
+            needsReauth = true;
+          }
+          throw e;
         }
-        let idToken = latest.id_token;
-        if (body.id_token !== undefined) {
-          const claims = await verifyIdToken(body.id_token, { clientId: latest.client_id, subject: latest.subject });
-          if (claims.iss !== latest.issuer) fail("identity_mismatch", "refreshed identity does not match stored account");
-          idToken = body.id_token;
+        try {
+          store.putAccount(next); // full replacement without marker
+        } catch {
+          // Rotated set could not be persisted; the old refresh token is
+          // probably invalid now. Fail closed; never retry with it.
+          needsReauth = true;
+          reauthRequired();
         }
-        const now = clock();
-        const next = {
-          ...latest,
-          scopes,
-          id_token: idToken,
-          access_token: body.access_token,
-          refresh_token: body.refresh_token,
-          token_type: "Bearer",
-          expires_at: now + body.expires_in * 1000,
-        };
-        delete next.earliest_refresh_at;
-        if (body.earliest_refresh_at !== undefined) next.earliest_refresh_at = body.earliest_refresh_at * 1000;
-        store.putAccount(next);
         return { ...next, key };
       });
     } catch (e) {
@@ -394,6 +428,7 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
   }
 
   async function getAccessToken() {
+    if (needsReauth) reauthRequired();
     if (!cached) {
       let active;
       try {
@@ -406,7 +441,9 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
     }
     let fresh = false;
     try {
-      fresh = usable(cached, clock());
+      // A refresh marker may belong to a live refresher (wait for it) or a
+      // crashed one (reauth_required): only refresh() can tell, under the lock.
+      fresh = cached.refresh_pending_since === undefined && usable(cached, clock());
     } catch (e) {
       // In-memory state may be stale (another process may have renewed);
       // refresh() re-reads the store under the lock and decides from there.

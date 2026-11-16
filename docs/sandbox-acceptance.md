@@ -184,3 +184,53 @@ Corrections (source, tests kept locally, not committed):
 Incident: during this run the Owner's first `sbx login` used a stale path file, so the env was not sourced and the command ran against the **existing** HOME ("You are signed in"). The existing auth store file under `~/.config/com.docker.sandboxes/com.docker.sandboxes-auth/` was rewritten at that moment (login re-save or routine refresh; not distinguishable). The existing session kept working and no existing policy/daemon/Sandbox changed.
 
 Remaining: hook refusal behaviour (bad mode/provider) on real Core and compaction/title requests were not exercised; `text.verbosity` acceptance by the real SIWC endpoint, live inference and Task 3/5 live gates remain NOT_RUN.
+
+## Pre-live safety conditions (offline, local changes, not committed)
+
+| Item | Result | Notes |
+| --- | --- | --- |
+| M-6 credential lock | PASS (offline tests) | A lock is reclaimed only when its owner is certainly dead (pid gone, zombie, or different process start time/boot id for that pid). Live or unverifiable owners are never stolen regardless of age (`lock_timeout`); one reclaimer at a time via a guard file, with inode/content/owner re-check. Behaviour change: an ownerless/empty lockfile now fails closed instead of being recovered after `lockStaleMs` (the option is ignored). A hung live owner blocks waiters until an operator intervenes. |
+| M-10 refresh-token preservation | PASS as fail-closed; recovery NOT provided | A `refresh_pending_since` marker is persisted before the token POST (this also proves the store is writable). If the rotated tokens cannot be saved, or a marker is found while holding the lock, `getAccessToken` fails with `reauth_required`; the old token is never retried and there is no API-key/BYOK fallback. **Residual:** if the server already rotated the token and the save fails or the process crashes, the new token is lost and an explicit re-login is required. Timeouts/network errors/invalid 200 restore the old record; if the server had rotated anyway, the next attempt fails `refresh_rejected` (still fail-closed). |
+| Broker body-read timeout | PASS (offline tests) | `bodyReadTimeoutMs` (default 15 s) and finite headers/request timeouts; stalled clients are disconnected, no upstream call, no Permit held, size limits unchanged. |
+| Guest credential boundary (launcher) | PARTIAL | The launcher drops credential-like variables (`GH_TOKEN`, `GITHUB_*`, `ANTHROPIC_*`, `OPENAI_*`, `CF_*`, `AWS_*`, names with TOKEN/SECRET/PASSWORD/CREDENTIAL segments, `SSH_AUTH_SOCK`) from the OpenCode child environment; proxy, PATH, HOME, LANG, TERM and `GIT_CONFIG_*` are kept. This does **not** prove Sandbox-wide safety. |
+| `GH_TOKEN` injection source | NOT_VERIFIED (strongly indicated, not proven) | The `sbx` binary contains a sentinel substitution mechanism (`replaced_sentinel`, sentinel request/response) and a `github` service-secret type; `sbx secret` states that the proxy authenticates on behalf of the agent and the secret is never exposed to the Guest. The Guest value differs from the Host value (Host variable unset) and the independent daemon stores no secrets. **Note:** the existing daemon holds a global `openai` service secret (`oauth configured`) and allows OpenAI hosts; live use must not run in a Sandbox of the existing daemon. |
+| Core hook refusal paths (invalid mode, unapproved provider, init-failure fallback, non-Guest tool) on real Core | PASS (see "Final offline safety run" below) | Observed on real OpenCode Core v2.2.5. |
+| SIWC: JWKS URL | VERIFIED (public OIDC discovery) | `https://auth.openai.com/.well-known/openid-configuration` returns `jwks_uri` = `https://auth.openai.com/.well-known/jwks.json`, issuer `https://auth.openai.com`, `id_token_signing_alg_values_supported` = RS256; matches the implementation constant. |
+| SIWC: callback issued client ID parameter | VERIFIED (official docs) | The callback query parameter is `client_id`; on reauthorization the callback may omit it and a different value must be rejected. |
+| SIWC: `earliest_refresh_at` unit | NOT_VERIFIED | The field is not in the public docs; current implementation treats it as epoch seconds (an assumption). |
+| SIWC: `text.verbosity` support, unknown-field handling | NOT_VERIFIED | Not stated in the public docs. |
+| SIWC: refresh rotation contract | PARTIAL | Docs: refresh tokens rotate; replace access token, expiry, scopes and refresh token together; omit `scope`; serialize refreshes per session. Reuse detection and the response field set are not stated. |
+
+Live-credential readiness: **BLOCKED** until the Owner decides on (a) ~~the real-Core hook refusal run~~ (done, see below), (b) acceptance of the unproven `GH_TOKEN` source and the M-10 re-login residual, and (c) use only of the independent, secret-free daemon. No live credential or request was used.
+
+## Final offline safety run before live use (independent sandboxd, real Core v2.2.5, fake upstream)
+
+Setup as before (throwaway tmpfs HOME, `deny-all`, sandbox-scoped `localhost:49187`, no secrets in the independent daemon, Core from the local image, real Broker validation, scripted fake upstream, no live inference). Each `sbx` call was guarded to run only with the throwaway HOME. The Owner logged in only to the throwaway HOME (guarded command). Existing daemon, policy (197 allows), Sandbox list, Docker resources and `~/.docker` metadata were identical before and after; the existing auth store files changed once (about 40 s after the baseline, before the throwaway login), consistent with routine token refresh triggered by CLI calls against the existing HOME; unproven.
+
+Phase B, Guest credential boundary:
+
+| Item | Result |
+| --- | --- |
+| Independent daemon secrets | none (`secret ls`); the existing daemon has one global service secret (`openai`, oauth configured) and OpenAI hosts allowed, so the live path must never run in an existing-daemon Sandbox |
+| Guest credential-like variable names | `GH_TOKEN`, `MCP_SENTINEL_TOKEN_NAME` (+ `GIT_CONFIG_KEY_0`, not a credential). No `OPENAI_*`, `ANTHROPIC_*`, `CF_*`, `AWS_*`, `GITHUB_*`, `SSH_AUTH_SOCK`; no `auth.json`, `.netrc`, `.git-credentials`, `hosts.yml` |
+| `GH_TOKEN` value | 40 chars, `gho_` shape, differs from the Host `GITHUB_TOKEN` (the Host shell does have `GITHUB_TOKEN` set), low-entropy (14 distinct characters), contains the word `proxy`. Strongly indicates an sbx proxy placeholder; the injection code path and a way to disable it were **not** demonstrated |
+| Sending `GH_TOKEN` toward GitHub from the Guest | `api.github.com` / `github.com` through the proxy: 403, logged BLOCKED |
+| Launcher child environment vs launcher environment | real launcher + pipe handoff: `GH_TOKEN` and `MCP_SENTINEL_TOKEN_NAME` are absent in the OpenCode child; the capability is present only in the child (`OC_CF_AIG_BROKER_CAPABILITY`), never in argv (0 matches in process args) |
+| Verdict | **Sandbox credential isolation: PARTIAL.** `GH_TOKEN` source: **NOT_VERIFIED** (inferred). No real credential was found in the Guest. |
+
+Phase C, real Core fail-closed paths (each in its own process; a live Broker was listening during C1b'/C3a'):
+
+| Case | Result |
+| --- | --- |
+| C1 mode unset / invalid (`m3`) | Plugin setup fails; `Model unavailable: oc-cf-aig/gpt-6-luna`; no connection to the Broker (policy log shows no ALLOWED entry; live Broker saw 0 connections) |
+| C3 invalid Broker URL (`example.com`), malformed capability | same: model unavailable, 0 Broker connections, no fallback |
+| C3 control (valid mode/URL, capability unknown to the Broker) | 1 connection, `AI.Error: unauthorized` (proves the test can observe a request) |
+| C2 unapproved provider (`openai/gpt-5`, `anthropic/claude-sonnet-4-5` with dummy keys set only inside the Guest process) | Guest hook fired: `Guest refused a non-oc-cf-aig model request (no provider fallback)` (`provider.mjs` `refuseOtherProvider`); no Broker call, no external model request attempt in the policy log |
+| C4 M1 | `gateway-ok` received, `tools:null`, Broker admitted, fake upstream called once |
+| C4 M2 | only `read_file` (`strict:false`) published; executed in the Guest; replay with the same `call_id` and restored `guest` namespace; final text received; fixture exists only in the Guest |
+| C4 forged tool call (`bash`) | Core: `Tool is not available for this request`; Broker 400 on replay; no file written in the Guest |
+| C5 egress | ALLOWED only `localhost:49187`; BLOCKED: `models.opencode.ai:443` (Core model list), `github.com`, `api.github.com`; no bypass |
+
+Observation: one earlier invocation with the mode unset ran until a 90 s outer timeout (Core did not exit) before being stopped; later runs exited with code 1 in under 30 s. Not reproduced; no request was made.
+
+Live-credential readiness remains **BLOCKED**: `GH_TOKEN` source unproven, the M-10 re-login residual and the unverified SIWC items (`earliest_refresh_at` unit, `text.verbosity`, rotation/reuse contract) are unresolved, and no live path has been run.

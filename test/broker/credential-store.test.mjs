@@ -266,17 +266,192 @@ test("withLock treats a fresh empty/unparseable lockfile (holder mid-write) as l
   );
 });
 
-test("withLock recovers an empty lockfile only after it is older than lockStaleMs", async () => {
+test("withLock never reclaims an ownerless (empty) lockfile by age: unknown owner fails closed", async () => {
   const { file } = freshPath();
   createCredentialStore({ path: file }).ensureHostId();
   fs.writeFileSync(`${file}.lock`, "", { mode: 0o600 });
-  const old = new Date(Date.now() - 120_000);
+  ageLock(file);
+  await assert.rejects(
+    createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 80, lockStaleMs: 50 }).withLock(async () => assert.fail("stole lock")),
+    (e) => e instanceof CredentialStoreError && e.code === "lock_timeout",
+  );
+  assert.ok(fs.existsSync(`${file}.lock`), "ownerless lock not removed");
+});
+
+function ageLock(file, ms = 120_000) {
+  const old = new Date(Date.now() - ms);
   fs.utimesSync(`${file}.lock`, old, old);
+}
+
+const MOD_URL = new URL("../../src/broker/credential-store.mjs", import.meta.url).href;
+const HAS_PROC = fs.existsSync("/proc/self/stat");
+
+function bootId() {
+  try {
+    return fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+function spawnNode(script, args) {
+  return spawn(process.execPath, ["--input-type=module", "-e", script, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+}
+
+function exited(child) {
+  return new Promise((resolve) => (child.exitCode !== null ? resolve(child.exitCode) : child.on("exit", (c) => resolve(c))));
+}
+
+/** Spawn a child that holds the lock for `holdMs`; resolves once it reports holding it. */
+async function lockHolderChild(file, holdMs) {
+  const child = spawnNode(
+    `import { createCredentialStore } from ${JSON.stringify(MOD_URL)};
+     const s = createCredentialStore({ path: process.argv[1] });
+     await s.withLock(async () => { process.stdout.write("locked\\n"); await new Promise(r => setTimeout(r, Number(process.argv[2]))); });`,
+    [file, String(holdMs)],
+  );
+  await new Promise((resolve, reject) => {
+    child.stdout.on("data", (d) => String(d).includes("locked") && resolve());
+    child.on("exit", (c) => reject(new Error(`child exited ${c}`)));
+  });
+  return child;
+}
+
+test("lock owner record carries pid, token and process start identity", { skip: !HAS_PROC }, async () => {
+  const { file } = freshPath();
+  const store = createCredentialStore({ path: file, lockPollMs: 5 });
+  store.ensureHostId();
+  await store.withLock(async () => {
+    const info = JSON.parse(fs.readFileSync(`${file}.lock`, "utf8"));
+    assert.equal(info.pid, process.pid);
+    assert.equal(typeof info.start, "string");
+    assert.ok(info.start.length > 0);
+  });
+});
+
+test("M-6: a live owner holding the lock past lockStaleMs is never stolen", { skip: !HAS_PROC }, async () => {
+  const { file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  const child = await lockHolderChild(file, 1500);
+  try {
+    const before = fs.readFileSync(`${file}.lock`, "utf8");
+    ageLock(file);
+    await assert.rejects(
+      createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 200, lockStaleMs: 10 }).withLock(async () => assert.fail("stole live lock")),
+      (e) => e instanceof CredentialStoreError && e.code === "lock_timeout",
+    );
+    assert.equal(fs.readFileSync(`${file}.lock`, "utf8"), before, "live owner's lock untouched");
+  } finally {
+    child.kill("SIGKILL");
+    await exited(child);
+  }
+});
+
+test("M-6: a waiter enters only after a live long-running holder releases", async () => {
+  const { file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  const child = await lockHolderChild(file, 400);
+  ageLock(file);
+  let enteredWhileChildRunning = false;
+  await createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 5000, lockStaleMs: 10 }).withLock(async () => {
+    enteredWhileChildRunning = child.exitCode === null && fs.readFileSync(`${file}.lock`, "utf8").includes(`"pid":${child.pid}`);
+  });
+  assert.equal(enteredWhileChildRunning, false);
+  await exited(child);
+});
+
+test("M-6: a reused PID (live pid, different process start time) is reclaimed as dead", { skip: !HAS_PROC }, async () => {
+  const { file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  fs.writeFileSync(`${file}.lock`, JSON.stringify({ pid: process.pid, start: "0", boot: bootId(), created: Date.now(), token: "old-owner" }), { mode: 0o600 });
   let ran = false;
-  await createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 2000, lockStaleMs: 60_000 }).withLock(async () => {
+  await createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 2000 }).withLock(async () => {
     ran = true;
   });
   assert.ok(ran);
+});
+
+test("M-6: a live pid without recorded start time (cannot rule out PID reuse) fails closed, even when old", async () => {
+  const { file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  fs.writeFileSync(`${file}.lock`, JSON.stringify({ pid: process.pid, created: Date.now() - 120_000 }), { mode: 0o600 });
+  ageLock(file);
+  await assert.rejects(
+    createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 80, lockStaleMs: 10 }).withLock(async () => assert.fail("stole lock")),
+    (e) => e.code === "lock_timeout",
+  );
+  assert.ok(fs.existsSync(`${file}.lock`));
+});
+
+test("M-6: an owner whose process start time cannot be read is unknown and fails closed", async () => {
+  const { file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  fs.writeFileSync(`${file}.lock`, JSON.stringify({ pid: process.pid, start: "12345", created: Date.now(), token: "t" }), { mode: 0o600 });
+  ageLock(file);
+  const store = createCredentialStore({ path: file, lockPollMs: 5, lockTimeoutMs: 80, lockStaleMs: 10, processStat: () => null });
+  await assert.rejects(store.withLock(async () => assert.fail("stole lock")), (e) => e.code === "lock_timeout");
+  assert.ok(fs.existsSync(`${file}.lock`));
+});
+
+test("M-6: reclaim race: several waiter processes reclaim a dead lock and hold it strictly one at a time", async () => {
+  const { dir, file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]);
+  fs.writeFileSync(`${file}.lock`, JSON.stringify({ pid: Number(String(dead.stdout)), start: "1", created: Date.now(), token: "dead" }), { mode: 0o600 });
+  const log = path.join(path.dirname(dir), "race.log");
+  fs.writeFileSync(log, "");
+  const go = path.join(path.dirname(dir), "go");
+  const children = Array.from({ length: 4 }, (_, i) =>
+    spawnNode(
+      `import fs from "node:fs";
+       import { createCredentialStore } from ${JSON.stringify(MOD_URL)};
+       const [file, log, go, name] = process.argv.slice(1);
+       while (!fs.existsSync(go)) await new Promise(r => setTimeout(r, 2));
+       const s = createCredentialStore({ path: file, lockPollMs: 2, lockTimeoutMs: 10000 });
+       await s.withLock(async () => {
+         fs.appendFileSync(log, name + ":in\\n");
+         await new Promise(r => setTimeout(r, 40));
+         fs.appendFileSync(log, name + ":out\\n");
+       });`,
+      [file, log, go, `w${i}`],
+    ),
+  );
+  await new Promise((r) => setTimeout(r, 150));
+  fs.writeFileSync(go, "");
+  const codes = await Promise.all(children.map(exited));
+  assert.deepEqual(codes, [0, 0, 0, 0]);
+  const lines = fs.readFileSync(log, "utf8").trim().split("\n");
+  assert.equal(lines.length, 8);
+  for (let i = 0; i < lines.length; i += 2) {
+    const [n, s] = lines[i].split(":");
+    assert.equal(s, "in", lines.join(","));
+    assert.equal(lines[i + 1], `${n}:out`, `overlapping holders: ${lines.join(",")}`);
+  }
+  assert.ok(!fs.existsSync(`${file}.lock`));
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n !== "siwc.json"), [], "no guard/temp files left");
+});
+
+test("M-6: multi-process read-modify-write under withLock is serialized (no lost updates)", async () => {
+  const { dir, file } = freshPath();
+  createCredentialStore({ path: file }).ensureHostId();
+  const counter = path.join(path.dirname(dir), "counter");
+  fs.writeFileSync(counter, "0");
+  const children = Array.from({ length: 5 }, () =>
+    spawnNode(
+      `import fs from "node:fs";
+       import { createCredentialStore } from ${JSON.stringify(MOD_URL)};
+       const [file, counter] = process.argv.slice(1);
+       const s = createCredentialStore({ path: file, lockPollMs: 2, lockTimeoutMs: 10000 });
+       await s.withLock(async () => {
+         const n = Number(fs.readFileSync(counter, "utf8"));
+         await new Promise(r => setTimeout(r, 30));
+         fs.writeFileSync(counter, String(n + 1));
+       });`,
+      [file, counter],
+    ),
+  );
+  assert.deepEqual(await Promise.all(children.map(exited)), [0, 0, 0, 0, 0]);
+  assert.equal(fs.readFileSync(counter, "utf8"), "5");
 });
 
 test("lockfile is never observable without its owner record (atomic publish) and leaves no temp files", async () => {
@@ -302,4 +477,17 @@ test("release does not unlink a lock that was replaced by another holder", async
     fs.writeFileSync(`${file}.lock`, foreign, { mode: 0o600 });
   });
   assert.equal(fs.readFileSync(`${file}.lock`, "utf8"), foreign);
+});
+
+test("M-10: refresh-in-progress marker is persisted with the account and cleared by a full replacement", () => {
+  const { file } = freshPath();
+  const store = createCredentialStore({ path: file });
+  store.ensureHostId();
+  const key = store.putAccount(record(), { activate: true });
+  store.putAccount({ ...record(), refresh_pending_since: 1_234 });
+  assert.equal(createCredentialStore({ path: file }).getAccount(key).refresh_pending_since, 1_234);
+  assert.equal(createCredentialStore({ path: file }).getActive().refresh_pending_since, 1_234);
+  store.putAccount(record({ access_token: "new-access" }));
+  assert.equal(createCredentialStore({ path: file }).getAccount(key).refresh_pending_since, undefined);
+  assert.throws(() => store.putAccount({ ...record(), refresh_pending_since: "soon" }), (e) => e.code === "invalid_record");
 });

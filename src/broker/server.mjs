@@ -2,7 +2,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { BROKER_MODEL, PolicyError } from "./policy.mjs";
 
-const DEFAULT_LIMITS = { maxBodyBytes: 1024 * 1024, maxHeaderBytes: 8192 };
+const DEFAULT_LIMITS = { maxBodyBytes: 1024 * 1024, maxHeaderBytes: 8192, bodyReadTimeoutMs: 15_000, headersTimeoutMs: 10_000 };
 const TERMINAL_FAILURE = new Set(["response.failed", "response.incomplete", "error"]);
 
 function sendJson(res, status, error, code) {
@@ -17,17 +17,33 @@ function bearerOf(req) {
   return m ? m[1] : undefined;
 }
 
-async function readBody(req, max) {
+/** Reads the body with a finite wall-clock deadline; a stalled client is disconnected. */
+async function readBody(req, max, timeoutMs) {
   const declared = Number(req.headers["content-length"]);
   if (Number.isFinite(declared) && declared > max) throw new PolicyError(413, "request too large", "request_too_large");
   const chunks = [];
   let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > max) throw new PolicyError(413, "request too large", "request_too_large");
-    chunks.push(chunk);
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new PolicyError(408, "request body timeout", "request_timeout"));
+      req.destroy();
+    }, timeoutMs);
+  });
+  const read = (async () => {
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > max) throw new PolicyError(413, "request too large", "request_too_large");
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks, size);
+  })();
+  read.catch(() => {});
+  try {
+    return await Promise.race([read, deadline]);
+  } finally {
+    clearTimeout(timer);
   }
-  return Buffer.concat(chunks, size);
 }
 
 /** Incremental SSE validator: returns validated events, throws on invalid framing. */
@@ -110,7 +126,7 @@ export function createBrokerServer({ capabilities, parseRequest, upstream, limit
 
     let body;
     try {
-      body = await readBody(req, lim.maxBodyBytes);
+      body = await readBody(req, lim.maxBodyBytes, lim.bodyReadTimeoutMs);
     } catch (e) {
       return sendJson(res, e.status ?? 400, e.message, e.code);
     }
@@ -223,5 +239,9 @@ export function createBrokerServer({ capabilities, parseRequest, upstream, limit
       sendJson(res, 500, "internal error", "internal_error");
     }
   });
+  // Finite pre-authentication / request deadlines (Node defaults can be disabled by callers).
+  server.headersTimeout = lim.headersTimeoutMs;
+  server.requestTimeout = Math.max(lim.bodyReadTimeoutMs, lim.headersTimeoutMs) + 1000;
+  server.connectionsCheckingInterval = Math.min(1000, Math.max(50, Math.floor(lim.headersTimeoutMs / 2)));
   return server;
 }

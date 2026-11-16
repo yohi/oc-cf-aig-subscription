@@ -477,3 +477,132 @@ test("stale in-memory state is re-read under lock before failing token_expired",
   assert.equal(await src.getAccessToken(), "access-other-proc");
   assert.equal(auth.calls.refresh.length, 0);
 });
+
+// ---------------- M-10: rotating refresh token preservation ----------------
+
+const SIWC_URL = new URL("../../src/broker/siwc.mjs", import.meta.url).href;
+
+function noSecrets(e, extra = []) {
+  assertNoSecret(e, ["access-1", "refresh-1", "access-2", "refresh-2", ...extra]);
+}
+
+test("M-10: crash mid-refresh (process dies during token POST) leaves a marker; next process fails closed with reauth_required, no retry with old refresh token", async () => {
+  const cred = await loggedIn();
+  const { spawn } = await import("node:child_process");
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { createSIWCSource } from ${JSON.stringify(SIWC_URL)};
+       const fetch = async (url, init = {}) => {
+         if (init.method === "POST" && new URLSearchParams(String(init.body)).get("grant_type") === "refresh_token") process.exit(42);
+         throw new Error("unexpected network access");
+       };
+       const src = createSIWCSource({ credentialPath: process.argv[1], clock: () => Number(process.argv[2]), client: { fetch, timeoutMs: 200, lockPollMs: 5 } });
+       await src.getAccessToken();
+       process.exit(0);`,
+      cred,
+      String(T0 + 3600_000 - 1000),
+    ],
+    { stdio: "ignore" },
+  );
+  const code = await new Promise((r) => child.on("exit", r));
+  assert.equal(code, 42, "child crashed inside the refresh POST");
+  assert.equal(typeof createCredentialStore({ path: cred }).getActive().refresh_pending_since, "number", "durable marker written before POST");
+
+  // Restart: even with a still-fresh access token in the store, fail closed.
+  for (const at of [T0, T0 + 3600_000 - 1000]) {
+    nowMs = at;
+    const auth = mockAuth();
+    await assert.rejects(source(cred, auth).getAccessToken(), (e) => {
+      assert.ok(e instanceof SIWCError);
+      assert.equal(e.code, "reauth_required");
+      noSecrets(e);
+      return true;
+    });
+    assert.equal(auth.calls.refresh.length, 0, "never retried with the possibly-consumed refresh token");
+  }
+
+  // Explicit interactive re-login clears the marker.
+  nowMs = T0;
+  const again = await login(cred);
+  await again.done;
+  assert.equal(createCredentialStore({ path: cred }).getActive().refresh_pending_since, undefined);
+  assert.equal(await source(cred, mockAuth()).getAccessToken(), "access-1");
+});
+
+test("M-10: store write failure after successful rotation fails closed with reauth_required; no auto-retry with the old refresh token, also after restart", async () => {
+  const cred = await loggedIn();
+  const auth = mockAuth({
+    refreshBody: (n) => {
+      fs.chmodSync(cred, 0o640); // store refuses to save (unsafe mode) after the server rotated the token
+      return { access_token: `access-${n + 1}`, refresh_token: `refresh-${n + 1}`, token_type: "Bearer", expires_in: 3600, scope: SCOPE };
+    },
+  });
+  const seen = [];
+  const orig = {};
+  for (const m of ["log", "info", "warn", "error", "debug"]) {
+    orig[m] = console[m];
+    console[m] = (...a) => seen.push(a.join(" "));
+  }
+  const src = source(cred, auth);
+  nowMs = T0 + 3600_000 - 1000;
+  try {
+    await assert.rejects(src.getAccessToken(), (e) => {
+      assert.equal(e.code, "reauth_required");
+      noSecrets(e);
+      return true;
+    });
+    await assert.rejects(src.getAccessToken(), (e) => e.code === "reauth_required");
+  } finally {
+    Object.assign(console, orig);
+    fs.chmodSync(cred, 0o600);
+  }
+  assert.equal(auth.calls.refresh.length, 1, "no retry with the old refresh token in-process");
+  assert.ok(!/access-|refresh-/.test(seen.join("\n")), "no tokens logged");
+  const left = createCredentialStore({ path: cred }).getActive();
+  assert.equal(typeof left.refresh_pending_since, "number", "uncertain state stays detectable");
+
+  const restarted = mockAuth();
+  await assert.rejects(source(cred, restarted).getAccessToken(), (e) => e.code === "reauth_required");
+  assert.equal(restarted.calls.refresh.length, 0, "no retry with the old refresh token after restart");
+});
+
+test("M-10: unwritable store is detected before the token endpoint is called (old refresh token stays valid)", { skip: process.getuid?.() === 0 }, async () => {
+  const cred = await loggedIn();
+  const dir = path.dirname(cred);
+  const before = fs.readFileSync(cred, "utf8");
+  const auth = mockAuth();
+  nowMs = T0 + 3600_000 - 1000;
+  fs.chmodSync(dir, 0o500);
+  try {
+    await assert.rejects(source(cred, auth).getAccessToken(), (e) => {
+      assert.ok(e instanceof SIWCError);
+      assert.equal(e.code, "store_error");
+      noSecrets(e);
+      return true;
+    });
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
+  assert.equal(auth.calls.refresh.length, 0, "token endpoint never called");
+  assert.equal(fs.readFileSync(cred, "utf8"), before);
+  // Once writable again a normal refresh works.
+  assert.equal(await source(cred, auth).getAccessToken(), "access-2");
+});
+
+test("M-10: a second process starting while a refresh is in progress waits and gets the rotated token (marker is not mistaken for a crash)", async () => {
+  const cred = await loggedIn();
+  const auth = mockAuth({ refreshDelayMs: 120 });
+  nowMs = T0 + 3600_000 - 1000;
+  const a = source(cred, auth);
+  const pa = a.getAccessToken();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(typeof createCredentialStore({ path: cred }).getActive().refresh_pending_since, "number", "marker present mid-refresh");
+  const tb = await source(cred, auth).getAccessToken();
+  assert.equal(await pa, "access-2");
+  assert.equal(tb, "access-2");
+  assert.equal(auth.calls.refresh.length, 1);
+  assert.equal(createCredentialStore({ path: cred }).getActive().refresh_pending_since, undefined, "successful save clears the marker");
+});

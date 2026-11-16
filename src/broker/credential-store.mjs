@@ -47,6 +47,11 @@ function validateRecord(r) {
   if (r.identity_label !== undefined && r.identity_label !== null && typeof r.identity_label !== "string") {
     fail("invalid_record", "invalid credential record field identity_label");
   }
+  // Durable "refresh in progress" marker (M-10): written before a refresh
+  // POST, removed by the full replacement that stores the rotated set.
+  if (r.refresh_pending_since !== undefined && r.refresh_pending_since !== null && !Number.isFinite(r.refresh_pending_since)) {
+    fail("invalid_record", "invalid credential record field refresh_pending_since");
+  }
 }
 
 function sanitizeRecord(r) {
@@ -56,6 +61,7 @@ function sanitizeRecord(r) {
   out.expires_at = r.expires_at;
   if (Number.isFinite(r.earliest_refresh_at)) out.earliest_refresh_at = r.earliest_refresh_at;
   if (typeof r.identity_label === "string") out.identity_label = r.identity_label;
+  if (Number.isFinite(r.refresh_pending_since)) out.refresh_pending_since = r.refresh_pending_since;
   return out;
 }
 
@@ -76,13 +82,43 @@ function validateStore(data) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+/** "exists" | "gone" (ESRCH: certainly dead) | "unknown". */
+function pidExists(pid) {
   try {
     process.kill(pid, 0);
-    return true;
+    return "exists";
   } catch (e) {
-    return e.code === "EPERM";
+    if (e.code === "ESRCH") return "gone";
+    return e.code === "EPERM" ? "exists" : "unknown";
+  }
+}
+
+/**
+ * Linux process identity from /proc/<pid>/stat: { start, state } where start
+ * is field 22 (starttime, clock ticks since boot). null when unreadable
+ * (non-Linux, hidepid, raced exit): callers must treat that as unknown.
+ */
+function procStat(pid) {
+  let text;
+  try {
+    text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return null;
+  }
+  const close = text.lastIndexOf(")");
+  if (close < 0) return null;
+  const f = text.slice(close + 2).trim().split(/\s+/);
+  // f[0] is field 3 (state); starttime (field 22) is f[19].
+  if (f.length < 20 || !/^[0-9]+$/.test(f[19])) return null;
+  return { start: f[19], state: f[0] };
+}
+
+function readBootId() {
+  try {
+    const id = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return id || null;
+  } catch {
+    return null;
   }
 }
 
@@ -94,8 +130,15 @@ function pidAlive(pid) {
  * - Symlinks anywhere in the absolute path are refused (realpath must match).
  * - Writes go to an O_EXCL temp file in the same directory, fsync, rename,
  *   then fsync the directory, so readers see the old or new token set only.
- * - `withLock` is a cross-process O_EXCL lockfile with stale-holder recovery
- *   (dead PID or age > lockStaleMs). The lock covers the whole store file.
+ * - `withLock` is a cross-process lockfile (atomic hard-link publish). The
+ *   owner record holds pid + process start time + boot id. A lock is only
+ *   reclaimed when its owner is certainly dead (ESRCH, zombie, or a different
+ *   start time / boot id for that pid = PID reuse). A live or unverifiable
+ *   owner is never stolen, regardless of age: waiters fail closed with
+ *   lock_timeout. Reclaim is serialized by a short-lived guard file and
+ *   re-verifies the lock inode, record and owner death before unlinking.
+ *   (`lockStaleMs` is accepted for compatibility but no longer permits
+ *   stealing.)
  */
 export function createCredentialStore({
   path: filePath,
@@ -104,7 +147,8 @@ export function createCredentialStore({
   now = Date.now,
   lockPollMs = 25,
   lockTimeoutMs = 30_000,
-  lockStaleMs = 60_000,
+  processStat = procStat,
+  bootId = readBootId,
 } = {}) {
   if (typeof filePath !== "string" || !path.isAbsolute(filePath) || path.normalize(filePath) !== filePath || filePath.endsWith(path.sep)) {
     fail("unsafe_path", "credential path must be a normalized absolute file path");
@@ -261,10 +305,12 @@ export function createCredentialStore({
     return key;
   }
 
-  function readLockInfo() {
+  const guardPath = `${lockPath}.reclaim`;
+
+  function readLockInfo(p = lockPath) {
     let fd;
     try {
-      fd = fs.openSync(lockPath, O_RDONLY | O_NOFOLLOW);
+      fd = fs.openSync(p, O_RDONLY | O_NOFOLLOW);
     } catch (e) {
       if (e.code === "ENOENT") return null;
       if (e.code === "ELOOP") fail("unsafe_path", "credential lock must not be a symlink");
@@ -279,9 +325,111 @@ export function createCredentialStore({
       } catch {
         info = {};
       }
-      return { pid: info.pid, created: info.created, mtimeMs: st.mtimeMs, ino: st.ino, raw: JSON.stringify(info) };
+      if (!info || typeof info !== "object" || Array.isArray(info)) info = {};
+      return { pid: info.pid, start: info.start, boot: info.boot, ino: st.ino, raw: JSON.stringify(info) };
     } finally {
       fs.closeSync(fd);
+    }
+  }
+
+  function selfRecord(token) {
+    const self = processStat(process.pid);
+    return { pid: process.pid, start: self?.start ?? null, boot: bootId(), created: Date.now(), token };
+  }
+
+  /**
+   * "dead" only when owner death is certain; "alive" when the same process
+   * is verified running; otherwise "unknown" (fail closed, never reclaimed).
+   */
+  function ownerState(info) {
+    if (!Number.isInteger(info.pid) || info.pid <= 0) return "unknown";
+    const exists = pidExists(info.pid);
+    if (exists === "gone") return "dead";
+    if (exists !== "exists") return "unknown";
+    if (typeof info.start !== "string" || info.start === "") return "unknown";
+    const cur = processStat(info.pid);
+    if (!cur) return "unknown";
+    if (cur.start !== info.start) return "dead"; // pid reused by another process
+    if (typeof info.boot === "string" && info.boot !== "") {
+      const b = bootId();
+      if (b !== null && b !== info.boot) return "dead"; // same pid/start after reboot
+    }
+    if (cur.state === "Z" || cur.state === "X") return "dead"; // exited, not yet reaped
+    return "alive";
+  }
+
+  /**
+   * Publish an owner record atomically: write it to a private temp file, then
+   * hard-link into place (EEXIST if held). Observers never see a lock without
+   * its owner record. Returns the inode, or null if already held.
+   */
+  function publish(target, record, token) {
+    const tmp = path.join(dir, `.${base}.lock.${token}.${Buffer.from(randomBytes(4)).toString("hex")}.tmp`);
+    let ino;
+    try {
+      const fd = fs.openSync(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify(record));
+        fs.fsyncSync(fd);
+        ino = fs.fstatSync(fd).ino;
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* not created */
+      }
+      fail("lock_failed", "credential lock cannot be created");
+    }
+    let linked = false;
+    try {
+      fs.linkSync(tmp, target);
+      linked = true;
+    } catch (e) {
+      if (e.code !== "EEXIST") {
+        fs.unlinkSync(tmp);
+        fail("lock_failed", "credential lock cannot be created");
+      }
+    }
+    fs.unlinkSync(tmp);
+    return linked ? ino : null;
+  }
+
+  /** Unlink `p` only if it is still exactly the observed file and its owner is still certainly dead. */
+  function unlinkIfDead(p, seen) {
+    const again = readLockInfo(p);
+    if (!again || again.ino !== seen.ino || again.raw !== seen.raw) return;
+    if (ownerState(again) !== "dead") return;
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /**
+   * Reclaim a lock whose owner is certainly dead. Only the holder of the
+   * guard may unlink another owner's lock, so two waiters can never both
+   * pass the re-check and then remove a lock freshly linked by a third.
+   */
+  function reclaim(info, token) {
+    const guardIno = publish(guardPath, selfRecord(token), token);
+    if (guardIno === null) {
+      // Guard held: wait, unless its holder is certainly dead (crashed mid-reclaim).
+      const g = readLockInfo(guardPath);
+      if (g && ownerState(g) === "dead") unlinkIfDead(guardPath, g);
+      return;
+    }
+    try {
+      unlinkIfDead(lockPath, info);
+    } finally {
+      try {
+        if (fs.lstatSync(guardPath).ino === guardIno) fs.unlinkSync(guardPath);
+      } catch {
+        /* gone */
+      }
     }
   }
 
@@ -290,61 +438,13 @@ export function createCredentialStore({
     const token = Buffer.from(randomBytes(16)).toString("hex");
     const deadline = now() + lockTimeoutMs;
     for (;;) {
-      // Publish atomically: write the full owner record to a private temp
-      // file, then hard-link it into place (link fails with EEXIST if held).
-      // Waiters therefore never observe a lock without its owner record.
-      const tmp = path.join(dir, `.${base}.lock.${token}.tmp`);
-      let ino;
-      try {
-        const fd = fs.openSync(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
-        try {
-          fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, created: Date.now(), token }));
-          fs.fsyncSync(fd);
-          ino = fs.fstatSync(fd).ino;
-        } finally {
-          fs.closeSync(fd);
-        }
-      } catch {
-        try {
-          fs.unlinkSync(tmp);
-        } catch {
-          /* not created */
-        }
-        fail("lock_failed", "credential lock cannot be created");
-      }
-      let linked = false;
-      try {
-        fs.linkSync(tmp, lockPath);
-        linked = true;
-      } catch (e) {
-        if (e.code !== "EEXIST") {
-          fs.unlinkSync(tmp);
-          fail("lock_failed", "credential lock cannot be created");
-        }
-      }
-      fs.unlinkSync(tmp);
-      if (linked) return { token, ino };
+      const ino = publish(lockPath, selfRecord(token), token);
+      if (ino !== null) return { token, ino };
       const info = readLockInfo();
-      if (info) {
-        const age = Date.now() - info.mtimeMs;
-        // An owner record without a valid PID (legacy/foreign writer, torn
-        // write) is treated as live until it ages past lockStaleMs.
-        const deadOwner = Number.isInteger(info.pid) && info.pid !== process.pid && !pidAlive(info.pid);
-        const stale = deadOwner || age > lockStaleMs;
-        if (stale) {
-          // Re-check right before removal to avoid deleting a fresh lock.
-          const again = readLockInfo();
-          if (again && again.ino === info.ino && again.raw === info.raw) {
-            try {
-              fs.unlinkSync(lockPath);
-            } catch {
-              /* raced with another waiter */
-            }
-          }
-          continue;
-        }
-      }
+      // A live or unverifiable owner is never stolen, however old the lock.
+      if (info && ownerState(info) === "dead") reclaim(info, token);
       if (now() >= deadline) fail("lock_timeout", "timed out waiting for credential lock");
+      if (!info || !fs.existsSync(lockPath)) continue;
       await sleep(lockPollMs);
     }
   }

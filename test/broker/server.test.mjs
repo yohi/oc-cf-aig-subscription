@@ -604,3 +604,56 @@ test("credentialSource failure surfaces as 502 and releases Permit once", async 
     await res2.text();
   } finally { server.closeAllConnections?.(); await new Promise((r) => server.close(r)); }
 });
+
+// ---------- body read / pre-auth timeouts ----------
+
+const rawRequest = (h, head) => new Promise((resolve) => {
+  const sock = net.connect(h.server.address().port, "127.0.0.1");
+  let data = "";
+  sock.on("data", (d) => { data += d; });
+  sock.on("error", () => {});
+  sock.on("close", () => resolve(data));
+  sock.on("connect", () => sock.write(head));
+});
+
+test("timeouts: server header/request timeouts are finite and configurable", async () => {
+  const h = await harness({ limits: { bodyReadTimeoutMs: 1234 } });
+  try {
+    assert.ok(h.server.headersTimeout > 0 && h.server.headersTimeout <= 15_000);
+    assert.ok(h.server.requestTimeout > 0);
+  } finally { await h.done(); }
+  const d = await harness();
+  try {
+    assert.ok(d.server.requestTimeout > 0 && Number.isFinite(d.server.requestTimeout));
+  } finally { await d.done(); }
+});
+
+test("timeouts: stalled body is disconnected, upstream not called, no permit held", async () => {
+  const h = await harness({ limits: { bodyReadTimeoutMs: 150 } });
+  try {
+    const head = `POST /v1/responses HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${h.token}\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{"model":`;
+    const t0 = Date.now();
+    const out = await rawRequest(h, head);
+    assert.ok(Date.now() - t0 < 3000, "stalled client disconnected promptly");
+    assert.ok(!out.includes(h.token));
+    assert.equal(h.fetches.length, 0);
+    assert.equal(h.releases.count, 0, "no permit was ever acquired for a stalled body");
+    assert.equal(h.store.describe?.(h.id)?.concurrent ?? 0, 0);
+    // server still serves normal traffic
+    const res = await h.post(m1a());
+    assert.equal((await outcome(res)).success, true);
+    assert.equal(h.releases.count, 1);
+  } finally { await h.done(); }
+});
+
+test("timeouts: connection sending nothing or partial headers is closed", async () => {
+  const h = await harness({ limits: { bodyReadTimeoutMs: 150, headersTimeoutMs: 150 } });
+  try {
+    const t0 = Date.now();
+    await rawRequest(h, "");
+    await rawRequest(h, "POST /v1/responses HTTP/1.1\r\nHost: x\r\nauthori");
+    assert.ok(Date.now() - t0 < 6000);
+    assert.equal(h.fetches.length, 0);
+    assert.equal(h.releases.count, 0);
+  } finally { await h.done(); }
+});

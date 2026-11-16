@@ -154,3 +154,46 @@ test("process: inherited --capability-fd handoff (m2) and STOP cases", async () 
     assert.ok(!res.err.includes("HOST"), `${label}: no host secret in logs`);
   }
 });
+
+// ---------- credential-like variable filter (child env only) ----------
+// NOTE: this filter does not prove Sandbox-wide credential safety.
+
+const OPTS = { mode: "m1", brokerURL: BROKER_URL, capability: TEST_CAPABILITY };
+
+test("child env drops credential-like variables by exact name, prefix and suffix", () => {
+  const dropped = [
+    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_PAT", "ANTHROPIC_FOO", "OPENAI_ORG", "CF_ACCOUNT_ID",
+    "CLOUDFLARE_API_BASE", "AWS_PROFILE", "AZURE_CLIENT", "GOOGLE_APPLICATION_CREDENTIALS", "GEMINI_X", "HF_HOME",
+    "NPM_TOKEN", "NPM_CONFIG_TOKEN", "MCP_SENTINEL_TOKEN_NAME", "FOO_TOKEN", "FOO_SECRET", "FOO_PASSWORD", "FOO_API_KEY",
+    "FOO_APIKEY", "FOO_CREDENTIALS", "SSH_AUTH_SOCK",
+  ];
+  const parent = { PATH: "/usr/bin", ...Object.fromEntries(dropped.map((k) => [k, "value-" + k])) };
+  const env = buildChildEnv(parent, OPTS);
+  for (const k of dropped) assert.ok(!(k in env), k);
+  assert.equal(env.PATH, "/usr/bin");
+});
+
+test("child env keeps proxy, locale and GIT_CONFIG_* variables", () => {
+  const keep = {
+    HTTP_PROXY: "http://p:1", HTTPS_PROXY: "http://p:1", http_proxy: "http://p:1", https_proxy: "http://p:1", NO_PROXY: "x", no_proxy: "x",
+    PATH: "/usr/bin", HOME: "/h", LANG: "C", TERM: "xterm", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "k", GIT_CONFIG_VALUE_0: "v",
+  };
+  const env = buildChildEnv({ ...keep }, OPTS);
+  for (const [k, v] of Object.entries(keep)) assert.equal(env[k], v, k);
+});
+
+test("sentinel-looking credential values are still dropped; launcher env is not mutated; no value leaks in errors", () => {
+  const parent = { PATH: "/usr/bin", GH_TOKEN: "ghp_SENTINEL_looking_value", MCP_SENTINEL_TOKEN_NAME: "SENTINEL", FOO_SECRET: "s3cr3t-value" };
+  const snapshot = structuredClone(parent);
+  const env = buildChildEnv(parent, OPTS);
+  assert.ok(!("GH_TOKEN" in env) && !("MCP_SENTINEL_TOKEN_NAME" in env) && !("FOO_SECRET" in env));
+  assert.deepEqual(parent, snapshot);
+  assert.ok(!JSON.stringify(env).includes("SENTINEL") && !JSON.stringify(env).includes("s3cr3t-value"));
+  try {
+    buildChildEnv({ ...parent, CF_AIG_TOKEN: "leak-me-123" }, OPTS);
+    assert.fail("must refuse");
+  } catch (e) {
+    assert.ok(e instanceof LaunchError);
+    assert.ok(!e.message.includes("leak-me-123") && !e.message.includes("s3cr3t-value"));
+  }
+});
