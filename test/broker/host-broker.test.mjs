@@ -299,3 +299,35 @@ test("serve: capability write failure stops the broker and rejects", async () =>
     /* already closed */
   }
 });
+
+test("serve: rejected shutdown is handled and exits unsuccessfully", async () => {
+  const { reader, writer } = mkfifo();
+  const c = parseConfig({ argv: serveArgv(credPath()), env: baseEnv });
+  const exits = [];
+  const unhandled = [];
+  const originalExit = process.exit;
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.exit = (code) => exits.push(code);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await runServe(
+      { ...c, port: 0, capabilityFd: writer },
+      {
+        stderr: { write() {} },
+        startServe: async () => ({
+          capability: { token: "test-capability", id: "test-id" },
+          server: { address: () => ({ port: 12345 }) },
+          stop: async () => { throw new Error("shutdown failed"); },
+        }),
+      },
+    );
+    process.emit("SIGINT");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(exits, [1]);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+    process.exit = originalExit;
+    fs.closeSync(reader);
+  }
+});

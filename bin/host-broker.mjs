@@ -209,7 +209,7 @@ export async function runServe(config, { stderr = process.stderr, signals = true
   stderr.write(`host-broker listening on ${BIND_HOST}:${broker.server.address().port} (foreground; Ctrl-C to stop)\n`);
   if (signals) {
     const shutdown = () => {
-      broker.stop().finally(() => process.exit(0));
+      broker.stop().then(() => process.exit(0), () => process.exit(1));
     };
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
