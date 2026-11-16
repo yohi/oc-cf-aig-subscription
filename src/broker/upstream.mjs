@@ -21,7 +21,26 @@ export function createCloudflareUpstream({ gatewayBase, gatewayToken, credential
   const url = `${gatewayBase}${ROUTE}`;
 
   return async function upstream(parsed, signal) {
-    const accessToken = headerSafe(await credentialSource.getAccessToken(), "access token");
+    let accessTokenPromise = credentialSource.getAccessToken();
+    if (signal) {
+      if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+      let onAbort;
+      try {
+        accessTokenPromise = await Promise.race([
+          accessTokenPromise,
+          new Promise((_, reject) => {
+            onAbort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+            signal.addEventListener("abort", onAbort, { once: true });
+            if (signal.aborted) onAbort();
+          }),
+        ]);
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    } else {
+      accessTokenPromise = await accessTokenPromise;
+    }
+    const accessToken = headerSafe(accessTokenPromise, "access token");
     const body = { model: parsed.model, input: parsed.input, stream: true, store: false };
     if (parsed.include) body.include = parsed.include;
     if (parsed.instructions !== undefined) body.instructions = parsed.instructions;

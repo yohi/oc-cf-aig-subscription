@@ -90,18 +90,6 @@ function validateReasoning(item) {
   return item;
 }
 
-function validateArguments(args) {
-  let parsed;
-  try {
-    parsed = JSON.parse(args);
-  } catch {
-    throw bad("function_call arguments must be JSON");
-  }
-  if (!isObj(parsed)) throw bad("function_call arguments must be an object");
-  checkKeys(parsed, ["path"], [], "function_call arguments");
-  if (!isStr(parsed.path)) throw bad("function_call arguments.path must be a string");
-}
-
 function validateInput(input) {
   if (!Array.isArray(input) || input.length === 0) throw bad("input must be a non-empty array");
   const out = [];
@@ -124,7 +112,6 @@ function validateInput(input) {
         if (seenCalls.has(item.call_id)) throw bad("function_call: duplicate call_id");
         if (!isStr(item.arguments)) throw bad("function_call: arguments must be a string");
         for (const k of ["id", "status"]) if (k in item && !isStr(item[k])) throw bad(`function_call: ${k} must be a string`);
-        validateArguments(item.arguments);
         seenCalls.add(item.call_id);
         pending.add(item.call_id);
         const { namespace: _ns, ...rest } = item;

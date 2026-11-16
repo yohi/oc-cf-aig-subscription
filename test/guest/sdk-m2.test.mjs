@@ -92,6 +92,14 @@ test("5c: native history function_call without namespace is projected to SIWC na
   assert.equal(broker.upstream.at(-1).body.input.find((i) => i.type === "function_call").namespace, "guest");
 });
 
+test("functionCallEvents defaults omitted namespace but omits explicitly undefined namespace", () => {
+  const itemOf = (events) => events.find((event) => event.type === "response.output_item.done" && event.item.type === "function_call").item;
+  const omitted = itemOf(functionCallEvents());
+  const explicitUndefined = itemOf(functionCallEvents({ namespace: undefined }));
+  assert.equal(omitted.namespace, "guest");
+  assert.equal(Object.hasOwn(explicitUndefined, "namespace"), false);
+});
+
 test("5c negatives: unknown, dotted or foreign-namespace calls never execute (Guest or Host)", async () => {
   for (const [label, events] of [
     ["unknown bash", functionCallEvents({ name: "bash", namespace: undefined, callId: "call_bad1" })],

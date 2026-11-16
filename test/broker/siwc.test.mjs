@@ -50,7 +50,7 @@ function tmpCred() {
 }
 
 /** Mock official endpoints. Never touches the network. */
-function mockAuth({ idToken, tokenStatus = 200, tokenBody, refreshBody, refreshStatus = 200, refreshDelayMs = 0, hangRefresh = false } = {}) {
+function mockAuth({ idToken, tokenStatus = 200, tokenBody, refreshBody, refreshStatus = 200, refreshDelayMs = 0, hangRefresh = false, hangRefreshBody = false } = {}) {
   const calls = { token: [], refresh: [], jwks: 0, other: [] };
   let refreshN = 0;
   const fetch = async (url, init = {}) => {
@@ -67,6 +67,13 @@ function mockAuth({ idToken, tokenStatus = 200, tokenBody, refreshBody, refreshS
           return new Promise((_, reject) => init.signal?.addEventListener("abort", () => reject(init.signal.reason ?? new Error("aborted"))));
         }
         if (refreshDelayMs) await new Promise((r) => setTimeout(r, refreshDelayMs));
+        if (hangRefreshBody) {
+          return new Response(new ReadableStream({
+            start(controller) {
+              init.signal?.addEventListener("abort", () => controller.error(init.signal.reason), { once: true });
+            },
+          }));
+        }
         refreshN++;
         const body = typeof refreshBody === "function" ? refreshBody(refreshN, form) : refreshBody ?? {
           access_token: `access-${refreshN + 1}`,
@@ -172,6 +179,31 @@ test("first login: dynamic_agent_client, fixed agent_name_hint, stable Host ID, 
   assert.deepEqual([...acct.scopes].sort(), SCOPE.split(" ").sort());
   assert.equal(fs.statSync(cred).mode & 0o777, 0o600);
   assert.equal(auth.calls.other.length, 0);
+});
+
+test("login waits for the credential-store lock before initializing the Host ID", async () => {
+  const cred = tmpCred();
+  const store = createCredentialStore({ path: cred });
+  let releaseLock;
+  let acquiredLock;
+  const held = new Promise((resolve) => { releaseLock = resolve; });
+  const acquired = new Promise((resolve) => { acquiredLock = resolve; });
+  const holding = store.withLock(async () => {
+    acquiredLock();
+    await held;
+  });
+  await acquired;
+  const login = source(cred, mockAuth()).beginLogin();
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fs.existsSync(cred), false);
+  } finally {
+    releaseLock();
+  }
+  await holding;
+  const flow = await login;
+  assert.match(new URL(flow.url).searchParams.get("ext_agent_host_id"), /^urn:uuid:/);
+  await flow.cancel();
 });
 
 test("Host ID persists across logins and source restarts", async () => {
@@ -375,15 +407,16 @@ test("earliest_refresh_at defers refresh while the access token is still valid",
   assert.equal(auth.calls.refresh.length, 0);
 });
 
-for (const [name, opts, code] of [
-  ["invalid_grant 400", { refreshStatus: 400, refreshBody: { error: "invalid_grant", error_description: "refresh-1" } }, "refresh_rejected"],
-  ["401", { refreshStatus: 401, refreshBody: { error: "unauthorized" } }, "refresh_rejected"],
-  ["timeout", { hangRefresh: true }, "refresh_timeout"],
-  ["missing rotated refresh token", { refreshBody: { access_token: "access-2", token_type: "Bearer", expires_in: 3600 } }, "invalid_token_response"],
-  ["non-bearer token type", { refreshBody: { access_token: "access-2", refresh_token: "r2", token_type: "mac", expires_in: 3600 } }, "invalid_token_response"],
-  ["reduced scopes", { refreshBody: { access_token: "access-2", refresh_token: "r2", token_type: "Bearer", expires_in: 3600, scope: "openid" } }, "insufficient_scope"],
+for (const [name, opts, code, uncertain] of [
+  ["invalid_grant 400", { refreshStatus: 400, refreshBody: { error: "invalid_grant", error_description: "refresh-1" } }, "refresh_rejected", false],
+  ["401", { refreshStatus: 401, refreshBody: { error: "unauthorized" } }, "refresh_rejected", false],
+  ["timeout", { hangRefresh: true }, "refresh_timeout", true],
+  ["body timeout", { hangRefreshBody: true }, "refresh_timeout", true],
+  ["missing rotated refresh token", { refreshBody: { access_token: "access-2", token_type: "Bearer", expires_in: 3600 } }, "reauth_required", true],
+  ["non-bearer token type", { refreshBody: { access_token: "access-2", refresh_token: "r2", token_type: "mac", expires_in: 3600 } }, "reauth_required", true],
+  ["reduced scopes", { refreshBody: { access_token: "access-2", refresh_token: "r2", token_type: "Bearer", expires_in: 3600, scope: "openid" } }, "reauth_required", true],
 ]) {
-  test(`refresh failure (${name}) fails closed: no stale token, no BYOK, store unchanged, no secret in error`, async () => {
+  test(`refresh failure (${name}) fails closed with correct rotation certainty`, async () => {
     const cred = await loggedIn();
     const before = fs.readFileSync(cred, "utf8");
     const auth = mockAuth(opts);
@@ -393,7 +426,7 @@ for (const [name, opts, code] of [
       nowMs = T0 + 3600_000 + 1;
       await assert.rejects(source(cred, auth).getAccessToken(), (e) => {
         assert.ok(e instanceof SIWCError);
-        assert.equal(e.code, code);
+        assert.equal(e.code, uncertain ? "reauth_required" : code);
         assertNoSecret(e, ["access-1", "refresh-1", "sk-should-never-be-used"]);
         return true;
       });
@@ -401,7 +434,13 @@ for (const [name, opts, code] of [
       if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = prevKey;
     }
-    assert.equal(fs.readFileSync(cred, "utf8"), before);
+    const after = createCredentialStore({ path: cred }).getActive();
+    if (uncertain) {
+      assert.equal(typeof after.refresh_pending_since, "number");
+      await assert.rejects(source(cred, mockAuth()).getAccessToken(), (e) => e.code === "reauth_required");
+    } else {
+      assert.equal(fs.readFileSync(cred, "utf8"), before);
+    }
     assert.equal(auth.calls.other.length, 0);
   });
 }
@@ -453,7 +492,8 @@ test("refreshed id_token for another subject is rejected", async () => {
     }),
   });
   nowMs = T0 + 3600_000 - 1000;
-  await assert.rejects(source(cred, auth).getAccessToken(), (e) => e.code === "identity_mismatch");
+  await assert.rejects(source(cred, auth).getAccessToken(), (e) => e.code === "reauth_required");
+  assert.equal(typeof createCredentialStore({ path: cred }).getActive().refresh_pending_since, "number");
 });
 
 test("createSIWCSource refuses non-official authBase and missing fetch", () => {

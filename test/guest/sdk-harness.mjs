@@ -32,7 +32,9 @@ export const reasoningEvents = (enc) => [
   { type: "response.output_item.added", output_index: 0, item: { type: "reasoning", id: "rs_1", summary: [], encrypted_content: enc } },
   { type: "response.output_item.done", output_index: 0, item: { type: "reasoning", id: "rs_1", summary: [{ type: "summary_text", text: "think" }], encrypted_content: enc } },
 ];
-export const functionCallEvents = ({ name = "read_file", namespace = "guest", callId = "call_m2", args = '{"path":"fixture.txt"}', enc = "ENC-M2==" } = {}) => {
+export const functionCallEvents = (options = {}) => {
+  const { name = "read_file", callId = "call_m2", args = '{"path":"fixture.txt"}', enc = "ENC-M2==" } = options;
+  const namespace = Object.hasOwn(options, "namespace") ? options.namespace : "guest";
   const item = { type: "function_call", id: "fc_1", call_id: callId, name, ...(namespace === undefined ? {} : { namespace }), arguments: "" };
   return [
     { type: "response.created", response: { id: "resp_f" } },

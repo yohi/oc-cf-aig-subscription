@@ -104,14 +104,22 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
   let inflight = null;
   let needsReauth = false; // set when this process left the store in an uncertain refresh state
 
-  async function timedFetch(url, init, timeoutCode, failCode) {
+  async function timedFetch(url, init, timeoutCode, failCode, consume) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(new SIWCError(timeoutCode, "auth request timed out")), timeoutMs);
     try {
-      return await fetchImpl(url, { ...init, redirect: "error", signal: ac.signal });
-    } catch {
+      let res;
+      try {
+        res = await fetchImpl(url, { ...init, redirect: "error", signal: ac.signal });
+      } catch {
+        if (ac.signal.aborted) fail(timeoutCode, "auth request timed out");
+        fail(failCode, "auth request failed");
+      }
+      return await consume(res);
+    } catch (e) {
       if (ac.signal.aborted) fail(timeoutCode, "auth request timed out");
-      fail(failCode, "auth request failed");
+      if (e instanceof SIWCError) throw e;
+      throw new SIWCError(failCode, "auth request failed");
     } finally {
       clearTimeout(timer);
     }
@@ -119,12 +127,13 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
 
   async function loadJwks(force) {
     if (!force && jwksCache && clock() - jwksCache.fetchedAt < 10 * 60_000) return jwksCache.keys;
-    const res = await timedFetch(JWKS_URL, { method: "GET", headers: { accept: "application/json" } }, "jwks_timeout", "jwks_failed");
-    if (res.status !== 200) fail("jwks_failed", "JWKS endpoint rejected request");
-    const body = await readJson(res);
-    if (!body || !Array.isArray(body.keys)) fail("jwks_failed", "JWKS response invalid");
-    jwksCache = { keys: body.keys, fetchedAt: clock() };
-    return body.keys;
+    return timedFetch(JWKS_URL, { method: "GET", headers: { accept: "application/json" } }, "jwks_timeout", "jwks_failed", async (res) => {
+      if (res.status !== 200) fail("jwks_failed", "JWKS endpoint rejected request");
+      const body = await readJson(res);
+      if (!body || !Array.isArray(body.keys)) fail("jwks_failed", "JWKS response invalid");
+      jwksCache = { keys: body.keys, fetchedAt: clock() };
+      return body.keys;
+    });
   }
 
   async function verifyIdToken(idToken, { clientId, nonce, subject }) {
@@ -186,21 +195,23 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
   }
 
   async function postToken(form, kind) {
-    const res = await timedFetch(
+    return timedFetch(
       TOKEN_URL,
       { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: new URLSearchParams(form).toString() },
       `${kind}_timeout`,
       `${kind}_failed`,
+      async (res) => {
+        if (res.status !== 200) {
+          try {
+            await res.body?.cancel();
+          } catch {
+            /* ignore */
+          }
+          fail(`${kind}_rejected`, `token endpoint rejected ${kind} (HTTP ${res.status})`);
+        }
+        return readJson(res);
+      },
     );
-    if (res.status !== 200) {
-      try {
-        await res.body?.cancel();
-      } catch {
-        /* ignore */
-      }
-      fail(`${kind}_rejected`, `token endpoint rejected ${kind} (HTTP ${res.status})`);
-    }
-    return readJson(res);
   }
 
   // ---------------- login ----------------
@@ -209,7 +220,7 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
     let hostId;
     let active;
     try {
-      hostId = store.ensureHostId();
+      hostId = await store.withLock(() => store.ensureHostId());
       active = newAccount ? null : store.getActive();
     } catch (e) {
       fail("store_error", `credential store unavailable (${e.code ?? "error"})`);
@@ -401,13 +412,17 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
           delete next.earliest_refresh_at;
           if (body.earliest_refresh_at !== undefined) next.earliest_refresh_at = body.earliest_refresh_at * 1000;
         } catch (e) {
-          // No validated new token set was obtained: restore the previous
-          // record (clears the marker). If even that fails the marker stays
-          // and later attempts fail closed with reauth_required.
-          try {
-            store.putAccount(latest);
-          } catch {
+          // A non-success HTTP status confirms the refresh was rejected before
+          // rotation. Any transport or response-validation failure is uncertain.
+          if (e instanceof SIWCError && e.code === "refresh_rejected") {
+            try {
+              store.putAccount(latest);
+            } catch {
+              needsReauth = true;
+            }
+          } else {
             needsReauth = true;
+            reauthRequired();
           }
           throw e;
         }

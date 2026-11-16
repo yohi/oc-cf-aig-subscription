@@ -60,7 +60,7 @@ async function eventually(fn, ms = 2000) {
   }
 }
 
-async function harness({ respond, cap = {}, limits = {} } = {}) {
+async function harness({ respond, cap = {}, limits = {}, credentialSource } = {}) {
   const store = createCapabilityStore();
   const { token, id } = store.issue({
     sandboxID: "sbx-1", model: MODEL, ttlMs: 60_000, maxCalls: 1000, maxCallsPerWindow: 1000, windowMs: 1000,
@@ -82,7 +82,7 @@ async function harness({ respond, cap = {}, limits = {} } = {}) {
   };
   const upstream = createCloudflareUpstream({
     gatewayBase: GATEWAY, gatewayToken: "HOST-GATEWAY-TOKEN",
-    credentialSource: { getAccessToken: async () => "HOST-SIWC-TOKEN" }, fetchImpl,
+    credentialSource: credentialSource ?? { getAccessToken: async () => "HOST-SIWC-TOKEN" }, fetchImpl,
   });
   const server = createBrokerServer({
     capabilities, parseRequest: parseBrokerRequest, upstream,
@@ -279,9 +279,7 @@ const negatives = [
   ["dotted name guest.read_file", () => ({ ...m2Body(), input: [userMsg(), call({ name: "guest.read_file" }), callOut()] }), 400],
   ["foreign namespace", () => m2Body({ namespace: "other" }), 400],
   ["unknown call name", () => m2Body({ name: "bash" }), 400],
-  ["call bad arguments schema", () => m2Body({ arguments: '{"path":1}' }), 400],
-  ["call extra arguments", () => m2Body({ arguments: '{"path":"a","x":1}' }), 400],
-  ["call non-JSON arguments", () => m2Body({ arguments: "nope" }), 400],
+  ["call arguments are not a string", () => m2Body({ arguments: { path: "a" } }), 400],
   ["tool strict:true", () => ({ ...m2Body(), tools: [{ ...flatTool(), strict: true }] }), 400],
   ["tool strict missing", () => { const t = flatTool(); delete t.strict; return { ...m2Body(), tools: [t] }; }, 400],
   ["tool strict null", () => ({ ...m2Body(), tools: [{ ...flatTool(), strict: null }] }), 400],
@@ -318,6 +316,17 @@ for (const [label, build, status] of negatives) {
     } finally { await h.done(); }
   });
 }
+
+test("history function_call arguments are preserved without parsing their JSON shape", async () => {
+  const h = await harness();
+  try {
+    for (const args of ['{"path":1}', '{"path":"a","x":1}', "not-json"]) {
+      const res = await h.post(m2Body({ arguments: args }));
+      assert.equal((await outcome(res)).success, true);
+      assert.equal(h.fetches.at(-1).body.input[2].arguments, args);
+    }
+  } finally { await h.done(); }
+});
 
 test("negative: invalid JSON, non-object body, wrong content-type -> 400", async () => {
   const h = await harness();
@@ -605,6 +614,33 @@ test("credentialSource failure surfaces as 502 and releases Permit once", async 
   } finally { server.closeAllConnections?.(); await new Promise((r) => server.close(r)); }
 });
 
+for (const cancellation of ["expired", "revoked"]) {
+  test(`pending token wait ends HTTP request when capability is ${cancellation}`, async () => {
+    let startTokenWait;
+    let resolveToken;
+    const tokenWait = new Promise((resolve) => { resolveToken = resolve; });
+    const h = await harness({
+      cap: cancellation === "expired" ? { ttlMs: 150 } : {},
+      credentialSource: { getAccessToken: () => { startTokenWait?.(); return tokenWait; } },
+    });
+    try {
+      let startedResolve;
+      const started = new Promise((resolve) => { startedResolve = resolve; });
+      startTokenWait = startedResolve;
+      const response = h.post(m1a());
+      await started;
+      if (cancellation === "revoked") h.store.revoke(h.id);
+      const res = await response;
+      assert.equal(res.status, 502);
+      assert.equal(h.fetches.length, 0);
+      assert.equal(h.releases.count, 1);
+      resolveToken("HOST-SIWC-TOKEN");
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(h.fetches.length, 0, "late token resolution does not start an aborted request");
+    } finally { await h.done(); }
+  });
+}
+
 // ---------- body read / pre-auth timeouts ----------
 
 const rawRequest = (h, head) => new Promise((resolve) => {
@@ -638,7 +674,7 @@ test("timeouts: stalled body is disconnected, upstream not called, no permit hel
     assert.ok(!out.includes(h.token));
     assert.equal(h.fetches.length, 0);
     assert.equal(h.releases.count, 0, "no permit was ever acquired for a stalled body");
-    assert.equal(h.store.describe?.(h.id)?.concurrent ?? 0, 0);
+    assert.equal(h.store.describe()[0].active, 0);
     // server still serves normal traffic
     const res = await h.post(m1a());
     assert.equal((await outcome(res)).success, true);
