@@ -21,9 +21,9 @@ export function createCloudflareUpstream({ gatewayBase, gatewayToken, credential
   const url = `${gatewayBase}${ROUTE}`;
 
   return async function upstream(parsed, signal) {
+    if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
     let accessTokenPromise = credentialSource.getAccessToken();
     if (signal) {
-      if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
       let onAbort;
       try {
         accessTokenPromise = await Promise.race([

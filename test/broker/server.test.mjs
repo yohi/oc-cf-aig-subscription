@@ -585,6 +585,31 @@ test("createCloudflareUpstream validates gatewayBase and never forwards redirect
   assert.equal(init.method, "POST");
 });
 
+test("already-aborted request does not start access-token retrieval", async () => {
+  const reason = new Error("request already cancelled");
+  const controller = new AbortController();
+  controller.abort(reason);
+  let tokenCalls = 0;
+  let fetchCalls = 0;
+  const up = createCloudflareUpstream({
+    gatewayBase: GATEWAY,
+    gatewayToken: "g",
+    credentialSource: {
+      getAccessToken() {
+        tokenCalls++;
+        const rejected = Promise.reject(new Error("refresh must not start"));
+        rejected.catch(() => {});
+        return rejected;
+      },
+    },
+    fetchImpl: async () => { fetchCalls++; return new Response("x"); },
+  });
+
+  await assert.rejects(up({ model: MODEL, input: [userMsg()], stream: true, store: false }, controller.signal), (error) => error === reason);
+  assert.equal(tokenCalls, 0);
+  assert.equal(fetchCalls, 0);
+});
+
 test("credentialSource failure propagates and no fetch happens (no fallback)", async () => {
   let fetched = false;
   const up = createCloudflareUpstream({
