@@ -410,6 +410,7 @@ test("earliest_refresh_at defers refresh while the access token is still valid",
 for (const [name, opts, code, uncertain] of [
   ["invalid_grant 400", { refreshStatus: 400, refreshBody: { error: "invalid_grant", error_description: "refresh-1" } }, "refresh_rejected", false],
   ["401", { refreshStatus: 401, refreshBody: { error: "unauthorized" } }, "refresh_rejected", false],
+  ["504 after upstream rotation", { refreshStatus: 504, refreshBody: { error: "gateway_timeout" } }, "reauth_required", true],
   ["timeout", { hangRefresh: true }, "refresh_timeout", true],
   ["body timeout", { hangRefreshBody: true }, "refresh_timeout", true],
   ["missing rotated refresh token", { refreshBody: { access_token: "access-2", token_type: "Bearer", expires_in: 3600 } }, "reauth_required", true],

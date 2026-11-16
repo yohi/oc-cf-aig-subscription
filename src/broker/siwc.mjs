@@ -202,11 +202,15 @@ export function createSIWCSource({ credentialPath, authBase = AUTH_BASE, client 
       `${kind}_failed`,
       async (res) => {
         if (res.status !== 200) {
-          try {
-            await res.body?.cancel();
-          } catch {
-            /* ignore */
+          if (kind === "refresh") {
+            const body = await readJson(res);
+            const rejected =
+              (res.status === 400 && body?.error === "invalid_grant") ||
+              (res.status === 401 && body?.error === "unauthorized");
+            if (rejected) fail("refresh_rejected", `token endpoint rejected refresh (HTTP ${res.status})`);
+            fail("refresh_outcome_unknown", "refresh outcome is uncertain");
           }
+          try { await res.body?.cancel(); } catch { /* ignore */ }
           fail(`${kind}_rejected`, `token endpoint rejected ${kind} (HTTP ${res.status})`);
         }
         return readJson(res);
