@@ -2,10 +2,12 @@
 // Foreground, Host-only Broker entrypoint. No daemon/systemd registration.
 //   host-broker login --credential-path=<abs> [--new-account] [--id-token-hint]
 //   host-broker serve --credential-path=<abs> --gateway-base=<url> --port=<n>
-//                     --sandbox-label=<label> --capability-fd=<n>=3> <quotas...>
+//                     --sandbox-label=<label> --capability-fd=<n>=3>
+//                     --tls-cert=<abs> --tls-key=<abs> <quotas...>
 // CF_AIG_TOKEN is read from the environment only. Binds 127.0.0.1 only.
 import fs from "node:fs";
 import path from "node:path";
+import { createSecureContext } from "node:tls";
 import { pathToFileURL } from "node:url";
 import { createSIWCSource, SIWCError } from "../src/broker/siwc.mjs";
 import { createCapabilityStore } from "../src/broker/capabilities.mjs";
@@ -18,6 +20,7 @@ const GATEWAY_BASE = /^https:\/\/gateway\.ai\.cloudflare\.com\/v1\/[0-9a-f]{32}\
 // eslint-disable-next-line no-control-regex
 const UNSAFE_VALUE = /[\u0000-\u001f\u007f\s]/;
 const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
+const MAX_TLS_FILE_BYTES = 1024 * 1024;
 
 const QUOTAS = [
   ["ttlMs", "ttl-ms", "OC_CF_AIG_QUOTA_TTL_MS"],
@@ -36,6 +39,8 @@ const SERVE_VALUE_FLAGS = {
   port: "OC_CF_AIG_BROKER_PORT",
   "sandbox-label": "OC_CF_AIG_SANDBOX_LABEL",
   "capability-fd": "OC_CF_AIG_CAPABILITY_FD",
+  "tls-cert": "OC_CF_AIG_TLS_CERT",
+  "tls-key": "OC_CF_AIG_TLS_KEY",
   ...Object.fromEntries(QUOTAS.map(([, flag, env]) => [flag, env])),
 };
 const LOGIN_BOOL_FLAGS = new Set(["new-account", "id-token-hint"]);
@@ -132,11 +137,50 @@ export function parseConfig({ argv = [], env = {} } = {}) {
   if (!sandboxLabel) problems.push("missing sandbox label (--sandbox-label / OC_CF_AIG_SANDBOX_LABEL)");
   else if (!LABEL.test(sandboxLabel)) problems.push("sandbox label has invalid characters");
 
+  const tlsCertPath = pick("tls-cert");
+  if (!tlsCertPath) problems.push("missing TLS certificate (--tls-cert / OC_CF_AIG_TLS_CERT)");
+  else if (!path.isAbsolute(tlsCertPath) || path.normalize(tlsCertPath) !== tlsCertPath) problems.push("TLS certificate path must be a normalized absolute path");
+  const tlsKeyPath = pick("tls-key");
+  if (!tlsKeyPath) problems.push("missing TLS private key (--tls-key / OC_CF_AIG_TLS_KEY)");
+  else if (!path.isAbsolute(tlsKeyPath) || path.normalize(tlsKeyPath) !== tlsKeyPath) problems.push("TLS private-key path must be a normalized absolute path");
+
   const quotas = {};
   for (const [key, flag, envName] of QUOTAS) quotas[key] = positiveInt(pick(flag), `quota --${flag} / ${envName}`, problems);
 
   if (problems.length) throw new ConfigError(problems);
-  return { mode, host: BIND_HOST, credentialPath, gatewayBase, gatewayToken, port, capabilityFd, sandboxLabel, quotas };
+  return { mode, host: BIND_HOST, credentialPath, gatewayBase, gatewayToken, port, capabilityFd, sandboxLabel, tlsCertPath, tlsKeyPath, quotas };
+}
+
+function readTlsFile(filePath, { privateKey = false } = {}) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_CLOEXEC);
+    const info = fs.fstatSync(fd);
+    if (!info.isFile() || info.size <= 0 || info.size > MAX_TLS_FILE_BYTES) {
+      throw new ConfigError([privateKey ? "TLS private key must be a bounded regular file" : "TLS certificate must be a bounded regular file"]);
+    }
+    if (privateKey && (info.mode & 0o077) !== 0) {
+      throw new ConfigError(["TLS private key must not be accessible to group or other users"]);
+    }
+    return fs.readFileSync(fd);
+  } catch (error) {
+    if (error instanceof ConfigError) throw error;
+    throw new ConfigError([privateKey ? "TLS private key is missing or unsafe" : "TLS certificate is missing or unsafe"]);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function loadTlsMaterial(config) {
+  if (config.tlsCertPath === config.tlsKeyPath) throw new ConfigError(["TLS certificate and private key must be separate files"]);
+  const cert = readTlsFile(config.tlsCertPath);
+  const key = readTlsFile(config.tlsKeyPath, { privateKey: true });
+  try {
+    createSecureContext({ cert, key });
+  } catch {
+    throw new ConfigError(["TLS certificate and private key are invalid or do not match"]);
+  }
+  return { cert, key };
 }
 
 /**
@@ -145,12 +189,13 @@ export function parseConfig({ argv = [], env = {} } = {}) {
  * The capability token is returned to the caller only; never logged.
  */
 export async function startServe(config, { fetch: fetchImpl = globalThis.fetch } = {}) {
+  const tls = loadTlsMaterial(config);
   const credentialSource = createSIWCSource({ credentialPath: config.credentialPath, client: { fetch: fetchImpl } });
   await credentialSource.getAccessToken();
   const upstream = createCloudflareUpstream({ gatewayBase: config.gatewayBase, gatewayToken: config.gatewayToken, credentialSource, fetchImpl });
   const capabilities = createCapabilityStore();
   const capability = capabilities.issue({ sandboxID: config.sandboxLabel, model: BROKER_MODEL, ...config.quotas });
-  const server = createBrokerServer({ capabilities, parseRequest: parseBrokerRequest, upstream, limits: { maxBodyBytes: config.quotas.maxRequestBytes } });
+  const server = createBrokerServer({ capabilities, parseRequest: parseBrokerRequest, upstream, limits: { maxBodyBytes: config.quotas.maxRequestBytes }, tls });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(config.port, BIND_HOST, resolve);

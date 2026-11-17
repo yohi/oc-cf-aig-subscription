@@ -13,6 +13,7 @@ import { parseBrokerRequest } from "../../src/broker/policy.mjs";
 import { createCloudflareUpstream } from "../../src/broker/upstream.mjs";
 import { createBrokerServer } from "../../src/broker/server.mjs";
 import { createFakeCore } from "./harness.mjs";
+import { createTlsFixture, httpsRequest } from "../broker/tls-fixtures.mjs";
 
 export const GUEST_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../src/guest");
 const GATEWAY = `https://gateway.ai.cloudflare.com/v1/${"0".repeat(32)}/offline-gw`;
@@ -48,6 +49,7 @@ export const functionCallEvents = (options = {}) => {
 
 /** Real Broker on 127.0.0.1:0 with a scripted fake Cloudflare upstream. */
 export async function startBroker() {
+  const tlsFixture = createTlsFixture();
   const store = createCapabilityStore();
   const { token, id } = store.issue({
     sandboxID: "offline-guest", model: "gpt-6-luna", ttlMs: 60_000, maxCalls: 100, maxCallsPerWindow: 100, windowMs: 1000,
@@ -69,22 +71,28 @@ export async function startBroker() {
     },
     upstream: createCloudflareUpstream({ gatewayBase: GATEWAY, gatewayToken: "OFFLINE-GATEWAY-TOKEN", credentialSource: { getAccessToken: async () => "OFFLINE-HOST-SIWC" }, fetchImpl }),
     limits: { maxBodyBytes: 256 * 1024 },
+    tls: { cert: tlsFixture.certBytes, key: tlsFixture.keyBytes },
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const brokerURL = `http://127.0.0.1:${server.address().port}/v1`;
-  const postRaw = (body) => fetch(`${brokerURL}/responses`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+  const brokerURL = `https://127.0.0.1:${server.address().port}/v1`;
+  const postRaw = (body) => httpsRequest(`${brokerURL}/responses`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) }, tlsFixture.ca);
   return {
-    brokerURL, token, id, store, inbound, upstream, script, postRaw,
-    stop: () => new Promise((r) => { store.revoke(id); server.close(r); server.closeAllConnections?.(); }),
+    brokerURL, token, id, store, inbound, upstream, script, postRaw, ca: tlsFixture.ca,
+    stop: async () => {
+      store.revoke(id);
+      await new Promise((r) => { server.close(r); server.closeAllConnections?.(); });
+      tlsFixture.cleanup();
+    },
   };
 }
 
 /** Load the Guest plugin by DIRECTORY through the real Host.resolve/Host.load and run its setup. */
-export async function loadGuestPlugin(env) {
+export async function loadGuestPlugin(env, ca) {
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
   const entry = Host.resolve({ directory: GUEST_DIR });
   const mod = await Host.load(entry.server);
   const core = createFakeCore();
+  core.tlsCa = ca;
   await mod.default.setup(core.ctx);
   return { core, entry };
 }
@@ -118,7 +126,13 @@ export async function runPrimaryTurn(core, { messages, promptCacheKey = "ses_aff
     const request = new Request(input, init);
     httpRequests.push(request.url);
     await core.runHook("http.request", { sessionID: "ses_offline", agent: "build", model: context.model, kind: "primary", request: request.clone() }, info.id);
-    return realFetch(request);
+    const body = await request.arrayBuffer();
+    return httpsRequest(request.url, {
+      method: request.method,
+      headers: Object.fromEntries(request.headers),
+      body: Buffer.from(body),
+      signal: request.signal,
+    }, core.tlsCa);
   };
   try {
     const response = await ai.generate({ model, messages: context.messages, tools, promptCacheKey, generation: context.options });

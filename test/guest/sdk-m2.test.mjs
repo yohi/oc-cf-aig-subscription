@@ -18,7 +18,7 @@ const broker = await startBroker();
 after(() => broker.stop());
 const { core } = await loadGuestPlugin({
   OC_CF_AIG_ACCEPTANCE_MODE: "m2", OC_CF_AIG_BROKER_URL: broker.brokerURL, OC_CF_AIG_BROKER_CAPABILITY: broker.token, OC_CF_AIG_GUEST_FIXTURE_ROOT: root,
-});
+}, broker.ca);
 const EXPECTED_TOOL = { type: "function", name: "read_file", description: GUEST_TOOL_DESCRIPTION, parameters: { ...READ_FILE_SCHEMA, properties: { path: { type: "string" } }, required: ["path"] }, strict: false };
 
 async function firstTurn(sseEvents, prompt = "read fixture.txt") {

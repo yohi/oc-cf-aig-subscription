@@ -60,7 +60,7 @@ export function freezeAcceptanceMode(value) {
 }
 
 export function validateBrokerURL(value) {
-  const fail = () => new Error("Broker URL must be http://<host.docker.internal|127.0.0.1>:<port>/v1");
+  const fail = () => new Error("Broker URL must be https://<host.docker.internal|127.0.0.1>:<port>/v1");
   if (typeof value !== "string" || value === "") throw fail();
   let url;
   try {
@@ -69,7 +69,7 @@ export function validateBrokerURL(value) {
     throw fail();
   }
   if (
-    url.protocol !== "http:" || !BROKER_HOSTS.has(url.hostname) || url.port === "" ||
+    url.protocol !== "https:" || !BROKER_HOSTS.has(url.hostname) || url.port === "" ||
     url.username || url.password || url.search || url.hash || !/^\/v1\/?$/.test(url.pathname) ||
     /[?#]/.test(value)
   ) throw fail();

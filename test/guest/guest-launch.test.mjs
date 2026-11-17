@@ -10,7 +10,7 @@ import { TEST_CAPABILITY } from "./harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const LAUNCHER = path.join(ROOT, "bin/guest-launch.mjs");
-const BROKER_URL = "http://host.docker.internal:49187/v1";
+const BROKER_URL = "https://host.docker.internal:49187/v1";
 
 function fakeOpencode({ version = "2.2.5" } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-opencode-"));
@@ -48,6 +48,7 @@ test("argument parsing: explicit mode/URL, no capability in argv, unknown flags 
   for (const bad of [
     [], ["--mode=m3", `--broker-url=${BROKER_URL}`], [`--broker-url=${BROKER_URL}`], ["--mode=m1"],
     ["--mode=m1", "--broker-url=https://api.openai.com/v1"],
+    ["--mode=m1", "--broker-url=http://127.0.0.1:49187/v1"],
     ["--mode=m1", `--broker-url=${BROKER_URL}`, `--capability=${TEST_CAPABILITY}`],
     ["--mode=m1", `--broker-url=${BROKER_URL}`, "--token=x"],
     ["--mode=m1", `--broker-url=${BROKER_URL}`, "--", "run", TEST_CAPABILITY],
@@ -176,6 +177,7 @@ test("child env drops credential-like variables by exact name, prefix and suffix
 test("child env keeps proxy, locale and GIT_CONFIG_* variables", () => {
   const keep = {
     HTTP_PROXY: "http://p:1", HTTPS_PROXY: "http://p:1", http_proxy: "http://p:1", https_proxy: "http://p:1", NO_PROXY: "x", no_proxy: "x",
+    NODE_EXTRA_CA_CERTS: "/oc2/runtime/abc/broker/ca/host-broker-ca.pem",
     PATH: "/usr/bin", HOME: "/h", LANG: "C", TERM: "xterm", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "k", GIT_CONFIG_VALUE_0: "v",
   };
   const env = buildChildEnv({ ...keep }, OPTS);

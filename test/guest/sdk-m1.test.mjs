@@ -10,7 +10,7 @@ import { DEFAULT_TOOL_NAMES } from "./harness.mjs";
 const broker = await startBroker();
 after(() => broker.stop());
 assert.equal(process.env.CF_AIG_TOKEN, undefined, "no Host Cloudflare token in the Guest test process");
-const { core } = await loadGuestPlugin({ OC_CF_AIG_ACCEPTANCE_MODE: "m1", OC_CF_AIG_BROKER_URL: broker.brokerURL, OC_CF_AIG_BROKER_CAPABILITY: broker.token });
+const { core } = await loadGuestPlugin({ OC_CF_AIG_ACCEPTANCE_MODE: "m1", OC_CF_AIG_BROKER_URL: broker.brokerURL, OC_CF_AIG_BROKER_CAPABILITY: broker.token }, broker.ca);
 
 test("M1 setup via real directory loader: provider only, no guest_read_file registration", () => {
   assert.ok(core.providers.has("oc-cf-aig"));

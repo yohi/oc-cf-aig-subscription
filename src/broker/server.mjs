@@ -1,4 +1,4 @@
-import http from "node:http";
+import https from "node:https";
 import { once } from "node:events";
 import { BROKER_MODEL, PolicyError } from "./policy.mjs";
 
@@ -112,7 +112,8 @@ function createSseValidator() {
   };
 }
 
-export function createBrokerServer({ capabilities, parseRequest, upstream, limits = {} }) {
+export function createBrokerServer({ capabilities, parseRequest, upstream, limits = {}, tls }) {
+  if (!tls?.cert || !tls?.key) throw new TypeError("Broker HTTPS certificate and key are required");
   const lim = { ...DEFAULT_LIMITS, ...limits };
 
   async function handleResponses(req, res) {
@@ -214,7 +215,7 @@ export function createBrokerServer({ capabilities, parseRequest, upstream, limit
     }
   }
 
-  const server = http.createServer(async (req, res) => {
+  const server = https.createServer({ cert: tls.cert, key: tls.key }, async (req, res) => {
     try {
       const { pathname } = new URL(req.url, "http://localhost");
       if (pathname === "/health") {

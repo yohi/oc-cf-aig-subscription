@@ -1,17 +1,20 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import http from "node:http";
+import https from "node:https";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { parseConfig, ConfigError, startServe, runLogin, runServe } from "../../bin/host-broker.mjs";
 import { createCredentialStore } from "../../src/broker/credential-store.mjs";
+import { createTlsFixture } from "./tls-fixtures.mjs";
 
 const BIN = fileURLToPath(new URL("../../bin/host-broker.mjs", import.meta.url));
 const GATEWAY = `https://gateway.ai.cloudflare.com/v1/${"0123456789abcdef".repeat(2)}/my-gw`;
 const CF_SECRET = "cf-secret-token-zzzz";
+const TLS = createTlsFixture();
+after(() => TLS.cleanup());
 
 function credPath() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "oc2-bin-")));
@@ -31,7 +34,7 @@ const QUOTA_ARGS = [
 ];
 
 function serveArgv(cred, extra = []) {
-  return ["serve", `--credential-path=${cred}`, `--gateway-base=${GATEWAY}`, "--port=18431", "--sandbox-label=test-sbx", "--capability-fd=3", ...QUOTA_ARGS, ...extra];
+  return ["serve", `--credential-path=${cred}`, `--gateway-base=${GATEWAY}`, "--port=18431", "--sandbox-label=test-sbx", "--capability-fd=3", `--tls-cert=${TLS.cert}`, `--tls-key=${TLS.key}`, ...QUOTA_ARGS, ...extra];
 }
 
 const baseEnv = { CF_AIG_TOKEN: CF_SECRET };
@@ -45,6 +48,8 @@ test("serve: complete config validates; binds loopback only; token only from env
   assert.equal(c.credentialPath, cred);
   assert.equal(c.gatewayBase, GATEWAY);
   assert.equal(c.gatewayToken, CF_SECRET);
+  assert.equal(c.tlsCertPath, TLS.cert);
+  assert.equal(c.tlsKeyPath, TLS.key);
   assert.equal(c.capabilityFd, 3);
   assert.deepEqual(c.quotas, {
     ttlMs: 60000,
@@ -68,6 +73,8 @@ test("serve: env equivalents are accepted", () => {
     OC_CF_AIG_BROKER_PORT: "18432",
     OC_CF_AIG_SANDBOX_LABEL: "sbx",
     OC_CF_AIG_CAPABILITY_FD: "4",
+    OC_CF_AIG_TLS_CERT: TLS.cert,
+    OC_CF_AIG_TLS_KEY: TLS.key,
     OC_CF_AIG_QUOTA_TTL_MS: "1",
     OC_CF_AIG_QUOTA_MAX_CALLS: "1",
     OC_CF_AIG_QUOTA_MAX_CALLS_PER_WINDOW: "1",
@@ -81,6 +88,8 @@ test("serve: env equivalents are accepted", () => {
   const c = parseConfig({ argv: ["serve"], env });
   assert.equal(c.port, 18432);
   assert.equal(c.capabilityFd, 4);
+  assert.equal(c.tlsCertPath, TLS.cert);
+  assert.equal(c.tlsKeyPath, TLS.key);
 });
 
 const missingCases = [
@@ -89,6 +98,8 @@ const missingCases = [
   ["port", (a) => a.filter((x) => !x.startsWith("--port")), {}],
   ["sandbox label", (a) => a.filter((x) => !x.startsWith("--sandbox-label")), {}],
   ["capability fd", (a) => a.filter((x) => !x.startsWith("--capability-fd")), {}],
+  ["TLS certificate", (a) => a.filter((x) => !x.startsWith("--tls-cert")), {}],
+  ["TLS private key", (a) => a.filter((x) => !x.startsWith("--tls-key")), {}],
   ["CF_AIG_TOKEN", (a) => a, { CF_AIG_TOKEN: undefined }],
   ...QUOTA_ARGS.map((q) => [`quota ${q.split("=")[0]}`, (a) => a.filter((x) => x !== q), {}]),
 ];
@@ -113,6 +124,8 @@ for (const [name, extra, env] of [
   ["zero quota", ["--ttl-ms=0"], baseEnv],
   ["negative quota", ["--max-total-bytes=-1"], baseEnv],
   ["capability fd 1 (stdout)", ["--capability-fd=1"], baseEnv],
+  ["relative TLS certificate path", ["--tls-cert=relative.pem"], baseEnv],
+  ["relative TLS private-key path", ["--tls-key=relative.key"], baseEnv],
   ["token passed as argument", [`--gateway-token=${CF_SECRET}`], baseEnv],
   ["host override", ["--host=0.0.0.0"], baseEnv],
   ["unknown flag", ["--retry=3"], baseEnv],
@@ -156,6 +169,45 @@ test("startServe refuses to listen without a SIWC account", async () => {
   await assert.rejects(startServe({ ...c, port: 0 }, { fetch: async () => assert.fail("network") }), (e) => e.code === "not_logged_in");
 });
 
+test("startServe refuses an unsafe TLS private key before reading SIWC credentials", async () => {
+  const cred = credPath();
+  const unsafeKey = path.join(path.dirname(cred), "unsafe-server.key");
+  fs.mkdirSync(path.dirname(unsafeKey), { recursive: true });
+  fs.copyFileSync(TLS.key, unsafeKey);
+  fs.chmodSync(unsafeKey, 0o644);
+  const c = parseConfig({ argv: serveArgv(cred, [`--tls-key=${unsafeKey}`]), env: baseEnv });
+  await assert.rejects(
+    startServe({ ...c, port: 0 }, { fetch: async () => assert.fail("must reject TLS key before network") }),
+    (error) => error instanceof ConfigError && /TLS private key/.test(error.message),
+  );
+});
+
+test("startServe refuses a symlinked TLS certificate before reading SIWC credentials", async () => {
+  const cred = credPath();
+  const linkedCert = path.join(path.dirname(cred), "linked-server.pem");
+  fs.mkdirSync(path.dirname(linkedCert), { recursive: true });
+  fs.symlinkSync(TLS.cert, linkedCert);
+  const c = parseConfig({ argv: serveArgv(cred, [`--tls-cert=${linkedCert}`]), env: baseEnv });
+  await assert.rejects(
+    startServe({ ...c, port: 0 }, { fetch: async () => assert.fail("must reject TLS certificate before network") }),
+    (error) => error instanceof ConfigError && /TLS certificate is missing or unsafe/.test(error.message),
+  );
+});
+
+test("startServe refuses a TLS private key that does not match the leaf certificate", async () => {
+  const cred = credPath();
+  const other = createTlsFixture();
+  try {
+    const c = parseConfig({ argv: serveArgv(cred, [`--tls-key=${other.key}`]), env: baseEnv });
+    await assert.rejects(
+      startServe({ ...c, port: 0 }, { fetch: async () => assert.fail("must reject mismatched key before network") }),
+      (error) => error instanceof ConfigError && /invalid or do not match/.test(error.message),
+    );
+  } finally {
+    other.cleanup();
+  }
+});
+
 test("startServe binds 127.0.0.1 only, mints a capability and serves /health (offline)", async () => {
   const cred = credPath();
   const store = createCredentialStore({ path: cred });
@@ -181,7 +233,7 @@ test("startServe binds 127.0.0.1 only, mints a capability and serves /health (of
     assert.equal(addr.address, "127.0.0.1");
     assert.match(broker.capability.token, /^ocb_/);
     const res = await new Promise((resolve, reject) =>
-      http.get(`http://127.0.0.1:${addr.port}/health`, (r) => {
+      https.get({ hostname: "127.0.0.1", port: addr.port, path: "/health", ca: TLS.ca, servername: "host.docker.internal" }, (r) => {
         r.resume();
         r.on("end", () => resolve(r.statusCode));
       }).on("error", reject),

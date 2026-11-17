@@ -16,7 +16,7 @@ import { createFakeCore, envProxy, TEST_CAPABILITY, DEFAULT_TOOL_NAMES } from ".
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const GUEST_DIR = path.join(ROOT, "src/guest");
-const BROKER_URL = "http://127.0.0.1:49187/v1";
+const BROKER_URL = "https://127.0.0.1:49187/v1";
 
 function fixtureRoot() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guest-fixture-"));
@@ -145,13 +145,14 @@ test("mode is captured at startup; later env mutation cannot switch m1 to m2", a
   assert.equal(core.calls.toolTransform, 0);
 });
 
-test("Broker URL must be the approved plain-HTTP Broker /v1 origin", () => {
-  assert.equal(validateBrokerURL("http://host.docker.internal:49187/v1"), "http://host.docker.internal:49187/v1");
-  assert.equal(validateBrokerURL("http://127.0.0.1:49187/v1/"), "http://127.0.0.1:49187/v1");
+test("Broker URL must be the approved HTTPS Broker /v1 origin", () => {
+  assert.equal(validateBrokerURL("https://host.docker.internal:49187/v1"), "https://host.docker.internal:49187/v1");
+  assert.equal(validateBrokerURL("https://127.0.0.1:49187/v1/"), "https://127.0.0.1:49187/v1");
   for (const bad of [
-    undefined, "", "https://api.openai.com/v1", "http://evil.example:1/v1", "http://host.docker.internal/v1",
-    "http://host.docker.internal:49187/v2", "http://u:p@127.0.0.1:1/v1", "http://127.0.0.1:1/v1?x=1",
-    "http://127.0.0.1:1/v1#f", "https://gateway.ai.cloudflare.com/v1/a/b", "http://localhost:1/v1", "http://127.0.0.1:1/v1/responses",
+    undefined, "", "http://127.0.0.1:49187/v1", "https://api.openai.com/v1", "https://evil.example:1/v1",
+    "https://host.docker.internal/v1", "https://host.docker.internal:49187/v2", "https://u:p@127.0.0.1:1/v1",
+    "https://127.0.0.1:1/v1?x=1", "https://127.0.0.1:1/v1#f", "https://gateway.ai.cloudflare.com/v1/a/b",
+    "https://localhost:1/v1", "https://127.0.0.1:1/v1/responses",
   ]) assert.throws(() => validateBrokerURL(bad), /broker url/i, String(bad));
 });
 

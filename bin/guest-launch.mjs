@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Guest-only launcher (runs inside the disposable Sandbox).
-//   guest-launch --mode=m1|m2 --broker-url=http://host.docker.internal:<port>/v1
+//   guest-launch --mode=m1|m2 --broker-url=https://host.docker.internal:<port>/v1
 //                [--capability-fd=<n>=3>] [--fixture-root=<abs dir>] [--opencode=<abs path>]
 //                [-- <opencode args...>]
 // The Broker capability is read once from stdin (default) or an inherited

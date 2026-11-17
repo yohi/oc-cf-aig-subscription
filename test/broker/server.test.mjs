@@ -1,16 +1,34 @@
-import { test } from "node:test";
-import net from "node:net";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
+import https from "node:https";
+import tls from "node:tls";
 import { createCapabilityStore } from "../../src/broker/capabilities.mjs";
 import { parseBrokerRequest } from "../../src/broker/policy.mjs";
 import { createCloudflareUpstream } from "../../src/broker/upstream.mjs";
 import { createBrokerServer } from "../../src/broker/server.mjs";
+import { createTlsFixture, httpsRequest } from "./tls-fixtures.mjs";
 
 const MODEL = "gpt-6-luna";
 const ACCOUNT = "0123456789abcdef0123456789abcdef";
 const GATEWAY = `https://gateway.ai.cloudflare.com/v1/${ACCOUNT}/my-gw`;
 const SCHEMA = { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false };
 const encoder = new TextEncoder();
+const TLS = createTlsFixture();
+after(() => TLS.cleanup());
+
+function brokerFetch(url, options = {}) {
+  return httpsRequest(url, options, TLS.ca);
+}
+
+function httpsStatus(port, ca, servername) {
+  return new Promise((resolve, reject) => {
+    const request = https.get({ hostname: "127.0.0.1", port, path: "/health", ca, servername }, (response) => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode));
+    });
+    request.on("error", reject);
+  });
+}
 
 const flatTool = () => ({ type: "function", name: "read_file", description: "Read a file", parameters: structuredClone(SCHEMA), strict: false });
 const userMsg = (text = "gateway-ok") => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
@@ -87,11 +105,12 @@ async function harness({ respond, cap = {}, limits = {}, credentialSource } = {}
   const server = createBrokerServer({
     capabilities, parseRequest: parseBrokerRequest, upstream,
     limits: { maxBodyBytes: 64 * 1024, maxHeaderBytes: 4096, ...limits },
+    tls: { cert: TLS.certBytes, key: TLS.keyBytes },
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const base = `http://127.0.0.1:${server.address().port}`;
+  const base = `https://127.0.0.1:${server.address().port}`;
   const post = (body, { headers = {}, raw, auth = true, signal } = {}) =>
-    fetch(`${base}/v1/responses`, {
+    brokerFetch(`${base}/v1/responses`, {
       method: "POST",
       headers: { "content-type": "application/json", ...(auth ? { authorization: `Bearer ${token}` } : {}), ...headers },
       body: raw ?? JSON.stringify(body),
@@ -123,17 +142,40 @@ async function expectRejected(h, body, status, opts) {
 test("routes: health, models auth, method/path restrictions", async () => {
   const h = await harness();
   try {
-    assert.equal((await fetch(`${h.base}/health`)).status, 200);
-    assert.equal((await fetch(`${h.base}/v1/models`)).status, 401);
-    const models = await fetch(`${h.base}/v1/models`, { headers: { authorization: `Bearer ${h.token}` } });
+    assert.equal((await brokerFetch(`${h.base}/health`)).status, 200);
+    assert.equal((await brokerFetch(`${h.base}/v1/models`)).status, 401);
+    const models = await brokerFetch(`${h.base}/v1/models`, { headers: { authorization: `Bearer ${h.token}` } });
     assert.equal(models.status, 200);
     assert.deepEqual((await models.json()).data.map((m) => m.id), [MODEL]);
     assert.equal((await h.post(m1a(), { auth: false })).status, 401);
     assert.equal((await h.post(m1a(), { headers: { authorization: "Bearer forged" } })).status, 401);
-    assert.equal((await fetch(`${h.base}/v1/other`, { headers: { authorization: `Bearer ${h.token}` } })).status, 404);
-    assert.equal((await fetch(`${h.base}/v1/responses`, { method: "PUT", headers: { authorization: `Bearer ${h.token}` } })).status, 405);
+    assert.equal((await brokerFetch(`${h.base}/v1/other`, { headers: { authorization: `Bearer ${h.token}` } })).status, 404);
+    assert.equal((await brokerFetch(`${h.base}/v1/responses`, { method: "PUT", headers: { authorization: `Bearer ${h.token}` } })).status, 405);
     assert.equal(h.fetches.length, 0);
   } finally { await h.done(); }
+});
+
+test("HTTPS server accepts only certificates trusted for the requested Broker hostname", async () => {
+  const store = createCapabilityStore();
+  const server = createBrokerServer({
+    capabilities: store,
+    parseRequest: parseBrokerRequest,
+    upstream: async () => assert.fail("health does not call upstream"),
+    tls: { cert: TLS.certBytes, key: TLS.keyBytes },
+  });
+  try {
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port, address } = server.address();
+    assert.equal(address, "127.0.0.1");
+    assert.equal(await httpsStatus(port, TLS.ca, "host.docker.internal"), 200);
+    await assert.rejects(httpsStatus(port, TLS.ca, "wrong.example"));
+    await assert.rejects(httpsStatus(port, "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----", "host.docker.internal"));
+  } finally {
+    await new Promise((resolve) => {
+      server.close(resolve);
+      server.closeAllConnections?.();
+    });
+  }
 });
 
 // ---------- M1-A ----------
@@ -478,11 +520,20 @@ test("stalled non-reading client + duration/revoke abort closes the connection a
       respond: () => sseResponse(big, { hang: true }),
     });
     const body = JSON.stringify(m1a());
-    const sock = net.connect(h.server.address().port, "127.0.0.1");
+    const sock = tls.connect({
+      port: h.server.address().port,
+      host: "127.0.0.1",
+      ca: TLS.ca,
+      servername: "host.docker.internal",
+    });
     sock.pause();
     sock.on("error", () => {});
-    sock.write(`POST /v1/responses HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\nauthorization: Bearer ${h.token}\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
     try {
+      await new Promise((resolve, reject) => {
+        sock.once("secureConnect", resolve);
+        sock.once("error", reject);
+      });
+      sock.write(`POST /v1/responses HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\nauthorization: Bearer ${h.token}\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
       await eventually(() => assert.equal(h.fetches.length, 1));
       await new Promise((r) => setTimeout(r, 100));
       if (mode === "revoke") h.store.revoke(h.id);
@@ -625,15 +676,15 @@ test("credentialSource failure surfaces as 502 and releases Permit once", async 
   const store = createCapabilityStore();
   const { token } = store.issue({ sandboxID: "s", model: MODEL, ttlMs: 1e5, maxCalls: 5, maxCallsPerWindow: 5, windowMs: 1000, maxConcurrent: 1, maxRequestBytes: 1e5, maxResponseBytes: 1e5, maxTotalBytes: 1e6, maxRequestDurationMs: 1e4 });
   const up = createCloudflareUpstream({ gatewayBase: GATEWAY, gatewayToken: "g", credentialSource: { getAccessToken: async () => { throw new Error("SECRET-DETAIL"); } }, fetchImpl: async () => new Response("x") });
-  const server = createBrokerServer({ capabilities: store, parseRequest: parseBrokerRequest, upstream: up, limits: { maxBodyBytes: 65536, maxHeaderBytes: 4096 } });
+  const server = createBrokerServer({ capabilities: store, parseRequest: parseBrokerRequest, upstream: up, limits: { maxBodyBytes: 65536, maxHeaderBytes: 4096 }, tls: { cert: TLS.certBytes, key: TLS.keyBytes } });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   try {
-    const res = await fetch(`http://127.0.0.1:${server.address().port}/v1/responses`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(m1a()) });
+    const res = await brokerFetch(`https://127.0.0.1:${server.address().port}/v1/responses`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(m1a()) });
     const text = await res.text();
     assert.equal(res.status, 502);
     assert.ok(!text.includes("SECRET-DETAIL"));
     // concurrency slot (maxConcurrent:1) was released
-    const res2 = await fetch(`http://127.0.0.1:${server.address().port}/v1/responses`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(m1a()) });
+    const res2 = await brokerFetch(`https://127.0.0.1:${server.address().port}/v1/responses`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(m1a()) });
     assert.equal(res2.status, 502);
     await res2.text();
   } finally { server.closeAllConnections?.(); await new Promise((r) => server.close(r)); }
@@ -669,12 +720,17 @@ for (const cancellation of ["expired", "revoked"]) {
 // ---------- body read / pre-auth timeouts ----------
 
 const rawRequest = (h, head) => new Promise((resolve) => {
-  const sock = net.connect(h.server.address().port, "127.0.0.1");
+  const sock = tls.connect({
+    port: h.server.address().port,
+    host: "127.0.0.1",
+    ca: TLS.ca,
+    servername: "host.docker.internal",
+  });
   let data = "";
   sock.on("data", (d) => { data += d; });
   sock.on("error", () => {});
   sock.on("close", () => resolve(data));
-  sock.on("connect", () => sock.write(head));
+  sock.on("secureConnect", () => sock.write(head));
 });
 
 test("timeouts: server header/request timeouts are finite and configurable", async () => {

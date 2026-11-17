@@ -25,6 +25,75 @@ Load this directory as an absolute-path plugin in `opencode.jsonc`, then restart
 
 `OC_CF_AIG_HOST_ONLY` is an explicit opt-in, not proof of host isolation. Verify independently that the runtime is outside the Sandbox.
 
+## OC2 Guest-to-Host Broker TLS
+
+The OC2 Guest Provider uses a separate Host Broker contract. It accepts HTTPS
+only at `host.docker.internal` or `127.0.0.1`; it does not use this Host-only
+plugin's Cloudflare Gateway route. The Broker remains bound to `127.0.0.1`.
+
+Create a dedicated CA on an offline machine. Keep its encrypted private key and
+the passphrase offline; distribute only the public CA certificate:
+
+```sh
+umask 077
+openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 \
+  -subj "/CN=OC2 Broker Private CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -addext "subjectKeyIdentifier=hash" \
+  -addext "authorityKeyIdentifier=keyid:always,issuer" \
+  -keyout oc2-broker-ca.key \
+  -out oc2-broker-ca.pem
+```
+
+Generate the Broker leaf private key and CSR on the Host:
+
+```sh
+TLS_DIR="$HOME/.config/oc-cf-aig/tls"
+install -d -m 700 "$TLS_DIR"
+umask 077
+openssl req -new -newkey rsa:3072 -nodes \
+  -subj "/CN=host.docker.internal" \
+  -keyout "$TLS_DIR/broker.key" \
+  -out "$TLS_DIR/broker.csr"
+chmod 600 "$TLS_DIR/broker.key"
+```
+
+Transfer only `broker.csr` to the offline CA operator. Issue the leaf with
+these extensions:
+
+```ini
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+subjectAltName=DNS:host.docker.internal,IP:127.0.0.1
+```
+
+The offline signer runs:
+
+```sh
+openssl x509 -req -in broker.csr \
+  -CA oc2-broker-ca.pem -CAkey oc2-broker-ca.key -CAcreateserial \
+  -days 365 -extfile broker.ext -out broker.crt
+```
+
+Keep `oc2-broker-ca.key` offline. Return `broker.crt` to the Host and place the
+public `oc2-broker-ca.pem` where the operator can provide it to `oc2`. The
+Broker leaf key must remain a regular Host-only file with mode `0600`. Start
+`host-broker serve` with `--tls-cert "$TLS_DIR/broker.crt"` and
+`--tls-key "$TLS_DIR/broker.key"`; the options also accept the path variables
+`OC_CF_AIG_TLS_CERT` and `OC_CF_AIG_TLS_KEY`. Pass only the public CA
+certificate to dotfiles-ai with `--host-broker-ca-cert`.
+
+Do not copy either private key to dotfiles-ai, the Guest, a Sandbox, or a
+repository. Do not disable TLS verification or fall back to HTTP. For the full
+Sandbox launch procedure and capability handoff, see
+[Sandbox acceptance](sandbox-acceptance.md). Renew the leaf before expiry; CA
+rotation requires updating the public CA input and creates a distinct OC2
+Runtime Identity.
+
 ## Security properties
 
 The plugin requires a native SIWC OAuth account rather than an API key or legacy Codex login. It pins the Cloudflare Gateway origin, sets `cf-aig-no-wholesale: true`, disables AI Gateway-stored payloads and cache, forces HTTP transport without compression, and rejects direct or off-path session inference.
@@ -33,7 +102,7 @@ The plugin requires a native SIWC OAuth account rather than an API key or legacy
 
 When Cloudflare Gateway configuration is invalid but host-only opt-in is enabled, setup completes with OpenAI `model.request` and `http.request` hooks that reject requests. This guarantee requires the plugin to remain loaded; a plugin that is missing or fails to load cannot enforce the hooks.
 
-The plugin does not commit or store OAuth access or refresh tokens. At runtime, however, it can access the OpenCode OAuth token and Cloudflare Gateway token. This build is Host-only. **Do not deploy it to the OC2 Docker Sandbox**, where the guest would have access to those credentials. A separate Host-side authenticated bridge would require explicit Owner authorization and validation.
+The Host-only Gateway plugin does not commit or store OAuth access or refresh tokens, but can access the OpenCode OAuth token and Cloudflare Gateway token at runtime. **Do not deploy this plugin to the OC2 Docker Sandbox.** The separately authorized Guest-to-Host Broker is a distinct runtime: the Guest receives only a public CA certificate and a limited Broker capability, not these Host credentials. Its live Sandbox behavior still requires the acceptance procedure below.
 
 ## Checks and limitations
 
@@ -48,4 +117,4 @@ Unit tests use mocked hooks. They do not establish compatibility with a running 
 
 ## Changes requiring an Owner decision
 
-Do not add a Host bridge, modify network policy, deploy into the Sandbox, create further review tasks, or merge changes without a separate Owner decision.
+Do not extend the Broker contract, modify network policy, deploy into the Sandbox, create further review tasks, or merge changes without a separate Owner decision.
