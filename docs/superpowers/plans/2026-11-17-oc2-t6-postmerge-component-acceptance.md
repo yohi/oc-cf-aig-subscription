@@ -10,7 +10,7 @@
 
 **Tech Stack:** Node.js `>=22`, npm, native Node test runner (`node --test`), `@opencode/ai@2.2.5`, `@opencode/plugin@2.2.5`, JavaScript ESM; Git read-only commands. No Sandbox or Cloudflare/OAuth access.
 
-**Spec:** `docs/superpowers/specs/2026-11-17-oc2-t6-postmerge-component-acceptance-design.md` (PR #4, HEAD `5cfbe7ccffc9ac454a5720012c83da18567d6c95`).
+**Spec:** `docs/superpowers/specs/2026-11-17-oc2-t6-postmerge-component-acceptance-design.md` (PR #4; Design was created in commit `5cfbe7ccffc9ac454a5720012c83da18567d6c95`, **not** the current feature-branch HEAD).
 
 **Owner state:** PR #4 is Draft; its Design R0.1 is `DESIGN PROPOSED`. Writing this plan neither adopts the design nor approves T6 execution, code changes, feature branch creation, PR modifications or merge.
 
@@ -21,7 +21,7 @@
 - **Allowed work:** Read-only preflight and inspection, a single `npm test`, a single `npm run check`, and an in-response evidence/decision report.
 - **Prohibited:** Source/config/dependency edits, `npm install`/`npm ci`, checkout/fetch/reset/clean, Git writes, commit/push/PR, Sandbox/daemon/network-policy operations, OAuth/login/refresh, credential-store changes, real model inference, live M1/M2 retry, new tests or reviews, and Skills/MCP/development-Plugin orchestration.
 - **Credential boundary:** Actual SIWC and Cloudflare secrets remain Host-only; no Direct API/BYOK fallback, no Host-side Guest tool execution. Do not reveal credential values in output.
-- **Evidence integrity:** Distinguish `OBSERVED_PASS`, `REPORTED_PASS`, `FAIL`, `NOT_RUN`, `NOT_VERIFIED` and `BLOCKED`. A past PASS does not establish direct SSE evidence for the merged commit.
+- **Evidence integrity:** Distinguish `OBSERVED_PASS`, `REPORTED_PASS`, `FAIL`, `NOT_RUN`, `NOT_VERIFIED` and `BLOCKED`. The historical `NOT_RUN` in `docs/sandbox-acceptance.md` and later **USER/EXECUTOR_REPORTED** live outcomes in PR #3 reflect different points in time; do not reclassify reports as new `OBSERVED_PASS`. A past PASS does not establish direct SSE evidence for the merged commit. If either source is unavailable at execution, mark its affected claims `NOT_VERIFIED` and do not assert PASS without evidence.
 - **Execution owner:** Claude Code, only after authorization; final decision belongs to the Human Owner. No automatic follow-on task.
 
 ## Review Focus (existing coverage; no new tests)
@@ -43,7 +43,8 @@ If any named file/test is missing or excluded by the actual runner, state `NOT_V
 **Files:**
 - **Read:** `package.json` (scripts, Node floor, dependency pins)
 - **Read:** `docs/superpowers/specs/2026-11-17-oc2-t6-postmerge-component-acceptance-design.md` (requirements, evidence labels, stop rules; read from PR #4 if absent from `master`)
-- **Read:** `docs/sandbox-acceptance.md` (earlier offline and live evidence; historical descriptions are not reclassified as newly observed)
+- **Read:** `docs/sandbox-acceptance.md` (historical offline acceptance; its Task 3/5 live `NOT_RUN` entries describe the record's earlier point in time, not the later live execution outcomes)
+- **Read:** [merged PR #3](https://github.com/yohi/oc-cf-aig-subscription/pull/3) (subsequent Task 3 and Task 5 Host-only/M1/M2 live outcomes; **USER/EXECUTOR_REPORTED**, not newly observed by T6)
 - **Read/test only:** `test/broker/*.test.mjs`, `test/guest/*.test.mjs`, `test/gateway.test.mjs`
 - **Modify/Create:** **None** in repository. The outcome is a report in the execution response, not a committed artifact.
 
@@ -113,14 +114,15 @@ If any named file/test is missing or excluded by the actual runner, state `NOT_V
   npm test: OBSERVED_PASS <pass/fail/skip, exit> | FAIL | NOT_RUN
   npm run check: OBSERVED_PASS <exit> | FAIL | NOT_RUN
   Key contracts: Broker capability / SIWC / SSE / Guest M1-M2 — observed coverage and limits
-  Earlier live evidence: Host-only and M1 REPORTED_PASS; M2 FUNCTIONAL_PASS_REPORTED / ACCEPTANCE_EVIDENCE_INCOMPLETE
+  Evidence provenance: offline/historical NOT_RUN = docs/sandbox-acceptance.md; later live = PR #3 (USER/EXECUTOR_REPORTED); any unavailable source = affected claims NOT_VERIFIED
+  Earlier live evidence: Host-only and M1 USER/EXECUTOR_REPORTED PASS; M2 USER/EXECUTOR_REPORTED FUNCTIONAL_PASS_REPORTED / ACCEPTANCE_EVIDENCE_INCOMPLETE
   Still NOT_VERIFIED: M2 direct upstream namespace/completed/clean EOF, GH_TOKEN provenance, independent Cloudflare billing attribution
   Verdict: COMPONENT_ACCEPTANCE_READY | NOT_READY | BLOCKED
   Blockers / residual risks / unapproved actions: ...
   Final: OWNER_DECISION / STOP
   ```
 
-  For `COMPONENT_ACCEPTANCE_READY`, require exact HEAD and clean worktree, successful Step 3 and 4, and no newly observed safety-relevant blocker; it means **ready for an Owner decision**, **not** blanket production approval or automatic Opt-in. Do not turn `NOT_VERIFIED` into `PASS`, turn a capture failure into a proven functional failure, or require additional live attempts simply to eliminate Findings.
+  For `COMPONENT_ACCEPTANCE_READY`, require exact HEAD and clean worktree, successful Step 3 and 4, and no newly observed safety-relevant blocker; it means **ready for an Owner decision**, **not** blanket production approval or automatic Opt-in. Record the distinct source and chronology of each prior claim, and label any inaccessible referenced source `NOT_VERIFIED` for the affected claims. Do not turn `NOT_VERIFIED` into `PASS`, turn a capture failure into a proven functional failure, or require additional live attempts simply to eliminate Findings.
 
 - [ ] **Step 7: Stop.** No commit, push, PR, CodeRabbit, independent reviewer, second test attempt, Sandbox action or higher-level OC2 work starts from this plan. Any fix, live usage, release or separate Skills/MCP/Plugin task needs its own explicit Owner authorization.
 
