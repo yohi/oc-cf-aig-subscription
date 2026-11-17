@@ -45,13 +45,15 @@ No additional review/repair cycle is mandatory merely because an unverified item
 
 ## 4. Evidence baseline and uncertainty
 
+**Evidence provenance and chronology:** `docs/sandbox-acceptance.md` records the historical offline acceptance and marks Task 3/5 live as `NOT_RUN` **at that record's point in time**. Subsequent Host-only Task 3 and Guest Task 5 (M1/M2) live outcomes are documented as **USER/EXECUTOR_REPORTED** in [merged PR #3](https://github.com/yohi/oc-cf-aig-subscription/pull/3); they do not retroactively change the historical `NOT_RUN` entries and are not new `OBSERVED_PASS` evidence from T6. M2 remains **FUNCTIONAL_PASS_REPORTED / ACCEPTANCE_EVIDENCE_INCOMPLETE**. Direct captured M2 upstream SSE evidence for `namespace:"guest"`, POST #2 `response.completed`, and clean SSE termination remains **NOT_VERIFIED**. If either source cannot be obtained during T6 execution, mark the affected claims **NOT_VERIFIED** rather than asserting PASS without accessible evidence.
+
 | Item | Baseline | Evidence status |
 | --- | --- | --- |
 | PR #3 | Merged into `master` at `9cc106b5...` | GitHub verified |
 | Earlier offline Core M1/M2 | Fake Upstream / Guest tool / history replay recorded in `docs/sandbox-acceptance.md` | Fixed-HEAD acceptance record; subsequent `303 PASS / 0 FAIL` is executor-reported |
-| Host-only SIWC and Guest M1 live | PASS | USER/EXECUTOR_REPORTED; not to be repeated |
-| Guest M2 live | Actual Guest `read_file` + same `call_id` replay + final Core output reported, two HTTP 200 POSTs | FUNCTIONAL_PASS_REPORTED / ACCEPTANCE_EVIDENCE_INCOMPLETE |
-| M2 direct SSE capture | Orchestrator automatic verdict FAIL; no captured `namespace:"guest"`, `response.completed`, clean end | NOT_VERIFIED, not interpreted as functional failure |
+| Host-only SIWC and Guest M1 live | Later live outcomes documented in PR #3 | USER/EXECUTOR_REPORTED PASS; not to be repeated |
+| Guest M2 live | PR #3 reports Guest `read_file`, matching `call_id` replay, final Core output and two HTTP 200 POSTs | USER/EXECUTOR_REPORTED: FUNCTIONAL_PASS_REPORTED / ACCEPTANCE_EVIDENCE_INCOMPLETE |
+| M2 direct SSE capture | PR #3 reports orchestrator automatic FAIL; no captured `namespace:"guest"`, POST #2 `response.completed`, or clean end | NOT_VERIFIED, not interpreted as functional failure |
 | Isolated daemon / Guest egress | Deny-all, 0 global allow, 0 service secrets, sandbox-local Broker exception | Executor-reported for live run; existing daemon with 197 allows remains prohibited |
 | `GH_TOKEN` proxy sentinel origin | Conditional exception under fixed negative gates | PARTIAL / NOT_VERIFIED |
 | Cloudflare billing/usage attribution | No independent dashboard proof | NOT_VERIFIED |
