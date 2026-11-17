@@ -71,12 +71,12 @@ If any named file/test is missing or excluded by the actual runner, state `NOT_V
   ```sh
   node --version
   npm --version
-  test -f node_modules/@opencode/ai/package.json
-  test -f node_modules/@opencode/plugin/package.json
-  test -f node_modules/effect/package.json
+  test -f node_modules/@opencode/ai/package.json && \
+    test -f node_modules/@opencode/plugin/package.json && \
+    test -f node_modules/effect/package.json
   ```
 
-  Expected: Node.js major version `>=22`, npm available, installed package metadata present, and `package.json` still defines `"test": "node --test"` plus `"check"` syntax validation. Read installed package metadata if needed to confirm the declared exact pins (`@opencode/ai@2.2.5`, `@opencode/plugin@2.2.5`, `effect@4.0.6`). If missing, mismatched, or if scripts unexpectedly invoke live endpoints, **STOP as `BLOCKED`**. Do not install packages or authenticate.
+  Expected: Node.js major version `>=22`, npm available, all three installed package metadata files present, and `package.json` still defines `"test": "node --test"` plus `"check"` syntax validation. Read each installed package's `package.json` and confirm its actual `version` is exactly `@opencode/ai@2.2.5`, `@opencode/plugin@2.2.5`, and `effect@4.0.6`, respectively. If any metadata file is missing, a version mismatches or cannot be confirmed, or scripts unexpectedly invoke live endpoints, **STOP as `BLOCKED`**. Do not install packages or authenticate.
 
 - [ ] **Step 3: Execute the existing offline test suite exactly once.**
 
@@ -115,14 +115,14 @@ If any named file/test is missing or excluded by the actual runner, state `NOT_V
   npm run check: OBSERVED_PASS <exit> | FAIL | NOT_RUN
   Key contracts: Broker capability / SIWC / SSE / Guest M1-M2 — observed coverage and limits
   Evidence provenance: offline/historical NOT_RUN = docs/sandbox-acceptance.md; later live = PR #3 (USER/EXECUTOR_REPORTED); any unavailable source = affected claims NOT_VERIFIED
-  Earlier live evidence: Host-only and M1 USER/EXECUTOR_REPORTED PASS; M2 USER/EXECUTOR_REPORTED FUNCTIONAL_PASS_REPORTED / ACCEPTANCE_EVIDENCE_INCOMPLETE
+  Earlier live evidence (PR #3; preserve source as USER/EXECUTOR_REPORTED for each item): Host-only PASS | NOT_VERIFIED (PR #3 unavailable); M1 PASS | NOT_VERIFIED (PR #3 unavailable); M2 FUNCTIONAL_PASS_REPORTED / ACCEPTANCE_EVIDENCE_INCOMPLETE | NOT_VERIFIED (PR #3 unavailable)
   Still NOT_VERIFIED: M2 direct upstream namespace/completed/clean EOF, GH_TOKEN provenance, independent Cloudflare billing attribution
   Verdict: COMPONENT_ACCEPTANCE_READY | NOT_READY | BLOCKED
   Blockers / residual risks / unapproved actions: ...
   Final: OWNER_DECISION / STOP
   ```
 
-  For `COMPONENT_ACCEPTANCE_READY`, require exact HEAD and clean worktree, successful Step 3 and 4, and no newly observed safety-relevant blocker; it means **ready for an Owner decision**, **not** blanket production approval or automatic Opt-in. Record the distinct source and chronology of each prior claim, and label any inaccessible referenced source `NOT_VERIFIED` for the affected claims. Do not turn `NOT_VERIFIED` into `PASS`, turn a capture failure into a proven functional failure, or require additional live attempts simply to eliminate Findings.
+  For `COMPONENT_ACCEPTANCE_READY`, require exact HEAD and clean worktree, successful Step 3 and 4, and no newly observed safety-relevant blocker; it means **ready for an Owner decision**, **not** blanket production approval or automatic Opt-in. Record the distinct source and chronology of each prior claim, and label any inaccessible referenced source `NOT_VERIFIED` for the affected claims. For Earlier live evidence, choose `PASS` only when PR #3 is available and supports the claim; otherwise choose `NOT_VERIFIED` separately for Host-only, M1, and M2 while retaining `USER/EXECUTOR_REPORTED` as the reported source. Do not turn `NOT_VERIFIED` into `PASS`, turn a capture failure into a proven functional failure, or require additional live attempts simply to eliminate Findings.
 
 - [ ] **Step 7: Stop.** No commit, push, PR, CodeRabbit, independent reviewer, second test attempt, Sandbox action or higher-level OC2 work starts from this plan. Any fix, live usage, release or separate Skills/MCP/Plugin task needs its own explicit Owner authorization.
 
